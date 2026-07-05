@@ -361,6 +361,7 @@ class SlackTaskStream:
         rollover_chars: Optional[int] = None,
         reasoning_chars: Optional[int] = None,
         output_chars: Optional[int] = None,
+        header_label: Optional[str] = None,
     ) -> None:
         self.client = client
         self.channel = channel
@@ -368,6 +369,8 @@ class SlackTaskStream:
         self.recipient_team_id = recipient_team_id
         self.recipient_user_id = recipient_user_id
         self.task_display_mode = task_display_mode
+        # Identity prefix for the card header ("carnie · a3f2c1 · 14:32").
+        self.header_label = header_label
         # Config-driven tuning (None → class default). reasoning cap of 0
         # means uncapped; it is still clamped to SLACK_FIELD_CEILING.
         if rollover_age_s is not None and rollover_age_s > 0:
@@ -522,13 +525,21 @@ class SlackTaskStream:
         await self._refresh_turn_header()
 
     async def _refresh_turn_header(self) -> None:
-        """Set the collapsible header to a phrase summarizing the turn."""
+        """Set the collapsible header to a phrase summarizing the turn.
+
+        Prefixed with the identity label when one was provided
+        ("carnie · a3f2c1 · 14:32 — Searched · edited files") so multiple
+        cards in one thread — main turn + per-subagent streams — are
+        attributable at a glance.
+        """
         if not self._categories:
             return
         # Capitalize the first bucket, join the rest with " · ".
         cats = list(self._categories)
         cats[0] = cats[0][:1].upper() + cats[0][1:]
         header = " · ".join(cats)
+        if self.header_label:
+            header = f"{self.header_label} — {header}"
         if header != self._last_header:
             self._last_header = header
             await self.set_plan_title(header)
