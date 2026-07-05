@@ -17040,7 +17040,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             sub = _slack_subagent_streams.get(key)
             if sub is None and event_type == "subagent.start":
                 from gateway.slack_task_stream import SlackTaskStream
-                _n = f"#{number} " if number is not None else ""
+                _n = f"#{number}" if number is not None else ""
                 _short_goal = goal[:60] + ("…" if len(goal) > 60 else "")
                 sub = SlackTaskStream(
                     _slack_task_stream.client,
@@ -17049,7 +17049,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     task_display_mode=_slack_task_stream.task_display_mode,
                     recipient_team_id=_slack_task_stream.recipient_team_id,
                     recipient_user_id=_slack_task_stream.recipient_user_id,
-                    header_label=f"🔀 subagent {_n}· {_short_goal}",
+                    # Caps-lock identity + time first, then the goal —
+                    # per Minh 2026-07-06: "SUBAGENT 2 - time - then text".
+                    header_label=(
+                        f"🔀 SUBAGENT {_n} · {datetime.now().strftime('%H:%M')}"
+                        f" · {_short_goal}"
+                    ),
                 )
                 _slack_subagent_streams[key] = sub
             if sub is None or sub.disabled:
@@ -17076,11 +17081,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _slack_subagent_tool_idx[key] = idx
                 coro = sub.task_started(idx, str(tool_name), None)
             elif event_type == "subagent.complete":
-                # Settle every entry on the child card, then close its stream.
-                async def _finish(s=sub, okv=ok, k=key):
+                # Settle every entry, put the child's result summary on the
+                # final entry (the relay carries summary/duration/status —
+                # user-visible output was the missing piece), then close.
+                _summary = str(kwargs.get("summary") or kwargs.get("preview") or "")[:400]
+                _dur = float(kwargs.get("duration_seconds") or 0.0)
+
+                async def _finish(s=sub, okv=ok, k=key, summ=_summary, dur=_dur):
                     n = _slack_subagent_tool_idx.get(k, 0)
+                    # Settle the start entry (0) and each tool entry (1..n).
                     for i in range(n + 1):
                         await s.task_finished(i, "step", 0.0, okv)
+                    # New final entry carries the child's result summary.
+                    await s.task_started(n + 1, "delegate_task", "result")
+                    await s.task_finished(
+                        n + 1, "delegate_task", dur, okv,
+                        output=summ or None,
+                        summary="✅ completed" if okv else "failed",
+                    )
                     await s.stop()
                 coro = _finish()
             else:
