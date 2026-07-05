@@ -2147,12 +2147,30 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if hasattr(chunk, "model") and chunk.model:
                 model_name = chunk.model
 
-            # Accumulate reasoning content
+            # Accumulate reasoning content. Providers are not consistent
+            # about what a reasoning "delta" contains: most send true
+            # incremental tokens, but some re-send the ENTIRE accumulated
+            # reasoning as a trailing chunk (cumulative echo) or re-deliver
+            # an overlapping window after an internal reconnect. Naively
+            # appending stores the reasoning doubled (observed 2026-07-05:
+            # state.db rows with byte-identical doubled halves) and fires
+            # duplicated text at reasoning consumers. Normalize here — the
+            # single chokepoint every consumer (trajectory storage,
+            # reasoning_callback, CLI display) sits downstream of.
             reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             if reasoning_text:
-                reasoning_parts.append(reasoning_text)
-                _fire_first_delta()
-                agent._fire_reasoning_delta(reasoning_text)
+                _acc = "".join(reasoning_parts)
+                if _acc and reasoning_text.startswith(_acc):
+                    # Cumulative snapshot (full text so far + maybe new
+                    # tokens): keep only the new suffix.
+                    reasoning_text = reasoning_text[len(_acc):]
+                elif _acc and (reasoning_text in _acc):
+                    # Exact echo of text already accumulated: drop.
+                    reasoning_text = ""
+                if reasoning_text:
+                    reasoning_parts.append(reasoning_text)
+                    _fire_first_delta()
+                    agent._fire_reasoning_delta(reasoning_text)
 
             # Accumulate text content — fire callback only when no tool calls
             if delta and delta.content:

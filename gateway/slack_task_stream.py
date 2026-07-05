@@ -654,9 +654,17 @@ class SlackTaskStream:
             clipped = self._reasoning_details[-cap:]
             sp = clipped.find(" ")
             self._reasoning_details = "…" + clipped[sp + 1 if 0 <= sp < 40 else 0:]
-        # Title: head of the thought, set once, stable thereafter.
+        # Title: short TLDR-style header (Claude-app rhythm — headers are
+        # sub-sentence). First sentence of the thought, capped ~80 chars,
+        # set once and never rewritten; the full text lives in details.
         if not self._reasoning_title:
-            self._reasoning_title = f"💭 {_word_trim(self._reasoning_details, 240)}"[:250]
+            head = self._reasoning_details
+            for sep in (". ", "! ", "? ", " — "):
+                idx = head.find(sep)
+                if 0 < idx < 120:
+                    head = head[: idx + 1].rstrip(" —")
+                    break
+            self._reasoning_title = f"💭 {_word_trim(head, 80)}"[:250]
         if not self._started:
             return  # buffered — flushed by the first task_started
         await self._append_raw_task(
