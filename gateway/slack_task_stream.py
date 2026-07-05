@@ -303,11 +303,19 @@ class SlackTaskStream:
     # Cap on accumulated 💭 reasoning text per card. 0 = uncapped, bounded
     # only by SLACK_FIELD_CEILING below.
     REASONING_MAX_CHARS = 0
-    # Slack's documented limit for a markdown_text field is 12,000 chars;
-    # task_update details ride the same message budget. Absolute ceiling
-    # applied even when the user uncaps reasoning, so one card can't blow
-    # the whole message. (Rollover handles the cumulative budget.)
-    SLACK_FIELD_CEILING = 11_000
+    # Ceiling on the locally-kept reasoning copy (used for rollover replay).
+    # Probed 2026-07-05: single details chunks up to 32k accepted with no
+    # error — the documented 12k limit applies to markdown_text, not
+    # task_update details. 30k keeps one card's replay chunk comfortably
+    # under the rollover size budget while being far beyond any realistic
+    # single thinking burst.
+    SLACK_FIELD_CEILING = 30_000
+    # Minimum accumulated chars before a 💭 card is opened/updated.
+    # The flush timer can cut a burst mid-word (observed: a card containing
+    # just "I"); tiny fragments carry no signal, so hold them until the
+    # burst has substance. A pending fragment below this at finalize time
+    # is carried into the next burst rather than emitted as its own card.
+    REASONING_MIN_CHARS = 40
     # Per-tool result preview length on finished cards.
     OUTPUT_PREVIEW_CHARS = 120
     # Runaway guard: a turn pathological enough to need more fresh streams
@@ -371,6 +379,7 @@ class SlackTaskStream:
         self._reasoning_title: str = ""
         self._reasoning_details: str = ""
         self._reasoning_unsent: str = ""
+        self._reasoning_carry: str = ""
         self._reasoning_count = 0
         # Per-subagent state (card id → {tools, number, start-time}) for the
         # numbered, timed delegate cards.
@@ -640,9 +649,12 @@ class SlackTaskStream:
         if self._reasoning_open_id is None:
             self._reasoning_count += 1
             self._reasoning_open_id = f"think{self._reasoning_count}"
-            self._reasoning_details = ""
+            # Carry any sub-threshold fragment from the previous burst
+            # (see _finalize_reasoning_card) instead of starting empty.
+            self._reasoning_details = self._reasoning_carry
+            self._reasoning_unsent = self._reasoning_carry
+            self._reasoning_carry = ""
             self._reasoning_title = ""
-            self._reasoning_unsent = ""
         # ``details`` APPENDS across task_update chunks with the same id —
         # measured live 2026-07-05 (probe: two updates "AAA"/"BBB" stored
         # as "AAABBB"); title/status REPLACE. So each flush must send ONLY
@@ -661,6 +673,12 @@ class SlackTaskStream:
             clipped = self._reasoning_details[-cap:]
             sp = clipped.find(" ")
             self._reasoning_details = "…" + clipped[sp + 1 if 0 <= sp < 40 else 0:]
+        # Hold sub-threshold bursts: the flush timer can slice mid-word
+        # ("I" as a whole card). Don't open/update the card until the
+        # burst has substance; held text flushes with the next update or
+        # carries into the next burst at finalize.
+        if len(self._reasoning_details) < self.REASONING_MIN_CHARS:
+            return
         # Title: short TLDR-style header (Claude-app rhythm — headers are
         # sub-sentence). First sentence of the thought, capped ~80 chars,
         # set once and never rewritten; the full text lives in details.
@@ -683,14 +701,22 @@ class SlackTaskStream:
         )
 
     async def _finalize_reasoning_card(self) -> None:
-        """Mark the open 💭 card complete (called when the next tool starts).
+        """Settle the open 💭 card when the next tool starts.
 
-        Sends only the still-unsent tail of the burst (details APPEND
-        server-side; re-sending the full text would duplicate it). In the
-        buffered pre-stream case nothing has been sent yet, so the unsent
-        tail IS the full burst — correct either way.
+        Sub-threshold bursts (< REASONING_MIN_CHARS, e.g. a mid-word "I"
+        sliced off by the flush timer) never made it onto the card — carry
+        them into the next burst instead of emitting a fragment card.
+        Otherwise mark complete, sending only the still-unsent tail
+        (details APPEND server-side; re-sending duplicates).
         """
         if self._reasoning_open_id is None:
+            return
+        if len(self._reasoning_details) < self.REASONING_MIN_CHARS:
+            # Nothing was ever sent for this burst — roll it forward.
+            self._reasoning_carry = self._reasoning_details
+            self._reasoning_open_id = None
+            self._reasoning_details = ""
+            self._reasoning_unsent = ""
             return
         rid, title = self._reasoning_open_id, self._reasoning_title
         tail, self._reasoning_unsent = self._reasoning_unsent, ""
