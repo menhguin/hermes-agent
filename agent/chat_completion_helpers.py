@@ -900,15 +900,22 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         logging.debug(f"Captured reasoning ({len(reasoning_text)} chars): {reasoning_text}")
 
     if reasoning_text and agent.reasoning_callback:
-        # Skip callback when streaming is active — reasoning was already
-        # displayed during the stream via one of two paths:
-        #   (a) _fire_reasoning_delta (structured reasoning_content deltas)
-        #   (b) _stream_delta tag extraction (<think>/<REASONING_SCRATCHPAD>)
-        # When streaming is NOT active, always fire so non-streaming modes
-        # (gateway, batch, quiet) still get reasoning.
-        # Any reasoning that wasn't shown during streaming is caught by the
-        # CLI post-response display fallback (cli.py _reasoning_shown_this_turn).
-        if not agent.stream_delta_callback and not agent._stream_callback:
+        # Skip the callback when this response's reasoning was already
+        # delivered incrementally via _fire_reasoning_delta (structured
+        # reasoning_content deltas or streamed <think> tag extraction) —
+        # read-and-clear the latch it sets. Re-firing here handed consumers
+        # the SAME reasoning twice: once as deltas, once as the full
+        # accumulated text (observed as 2-4x duplicated sentences on the
+        # Slack native task cards, 2026-07-05). The previous guard tested
+        # ``stream_delta_callback``/``_stream_callback``, but those are the
+        # *text*-streaming consumers — None on gateway platforms even while
+        # reasoning deltas stream fine — so the guard never tripped there.
+        # When nothing streamed (non-streaming modes: batch, quiet,
+        # streaming-disabled providers), the latch is unset and we fire so
+        # those consumers still get reasoning exactly once.
+        _already_streamed = getattr(agent, "_reasoning_streamed_this_response", False)
+        agent._reasoning_streamed_this_response = False
+        if not _already_streamed:
             try:
                 agent.reasoning_callback(reasoning_text)
             except Exception:

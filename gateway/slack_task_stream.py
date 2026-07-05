@@ -95,35 +95,6 @@ def _word_trim(text: str, limit: int) -> str:
     return cut.rstrip() + "…"
 
 
-def _merge_reasoning(acc: str, incoming: str, probe: int = 200) -> str:
-    """Merge a new reasoning flush into the accumulated burst, dedup-aware.
-
-    Providers differ in what a "reasoning delta" contains: true deltas
-    (new tokens only), cumulative snapshots (entire reasoning so far), or
-    overlapping windows (tail of previous flush + new tokens). Naive
-    concatenation renders duplicated sentences on the 💭 card for the
-    latter two (observed live 2026-07-05: same sentence 4×).
-
-    Strategy: (1) if one side contains the other, keep the superset;
-    (2) otherwise find the longest suffix of ``acc`` that prefixes
-    ``incoming`` (checked down from ``probe`` chars) and splice at the
-    overlap; (3) no overlap → plain append.
-    """
-    if not acc:
-        return incoming.strip()
-    if not incoming:
-        return acc
-    if incoming in acc:
-        return acc
-    if acc in incoming:
-        return incoming.strip()
-    max_k = min(len(acc), len(incoming), probe)
-    for k in range(max_k, 9, -1):  # overlaps <10 chars are coincidence
-        if acc.endswith(incoming[:k]):
-            return acc + incoming[k:]
-    return (acc + " " + incoming).strip()
-
-
 def clean_output_preview(result: Any, limit: int = 300) -> Optional[str]:
     """Turn a raw tool result into a compact, human-readable card preview.
 
@@ -654,12 +625,12 @@ class SlackTaskStream:
         # content on the card, so the default cap is 0 (uncapped). The
         # effective ceiling is min(user cap or ∞, SLACK_FIELD_CEILING) —
         # keep the tail on overflow (freshest thinking reads best).
-        #
-        # Overlap-aware merge: some providers deliver reasoning as
-        # CUMULATIVE snapshots (full text so far) rather than deltas, and
-        # thread-timing can re-deliver overlapping windows. Naive append
-        # rendered the same sentences 3-4× (observed live 2026-07-05).
-        self._reasoning_details = _merge_reasoning(self._reasoning_details, line)
+        # Inputs are true deltas: the agent fires reasoning_callback once
+        # per streamed chunk, and the post-completion full-text re-fire is
+        # latched off (agent/chat_completion_helpers.py, the
+        # _reasoning_streamed_this_response guard), so plain append is
+        # correct — no dedup needed.
+        self._reasoning_details = (self._reasoning_details + " " + line).strip()
         cap = self.SLACK_FIELD_CEILING
         if self.REASONING_MAX_CHARS > 0:
             cap = min(self.REASONING_MAX_CHARS, cap)
