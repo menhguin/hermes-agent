@@ -48,16 +48,18 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # 2026-07-05; override like any display setting, globally or under
     # display.platforms.slack.
     #   rollover_age_s: proactively continue on a fresh streamed message
-    #     after this many seconds (Slack kills streams server-side —
-    #     message_not_in_streaming_state — so stay under its lifetime).
-    #   rollover_chars: proactively roll over after ~this much cumulative
-    #     content on one message (Slack's msg_too_long cap).
+    #     after this many seconds. Measured 2026-07-05: Slack kills a
+    #     stream ~306s after startStream even with active appends
+    #     (absolute lifetime, not inactivity) — 240 ≈ 80% with margin.
+    #   rollover_chars: loose size backstop — probed clean past ~62k
+    #     cumulative chars; per-field caps prevent the real msg_too_long
+    #     trigger (single oversized chunk).
     #   reasoning_chars: cap on the accumulated 💭 reasoning text kept in a
     #     card's collapsible details. 0 = uncapped (a safety ceiling near
     #     Slack's 12k markdown_text field limit still applies).
     #   output_chars: per-tool result preview length on finished cards.
     "tool_progress_native_rollover_age_s": 240,
-    "tool_progress_native_rollover_chars": 10_000,
+    "tool_progress_native_rollover_chars": 40_000,
     "tool_progress_native_reasoning_chars": 0,
     "tool_progress_native_output_chars": 120,
     "show_reasoning": False,

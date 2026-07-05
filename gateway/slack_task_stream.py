@@ -275,11 +275,15 @@ class SlackTaskStream:
     # Tuning defaults (overridable per-instance via __init__, which run.py
     # feeds from the display config keys tool_progress_native_*):
     #
-    # Proactive rollover thresholds: Slack kills streams at ~5 min and
-    # bounces appends once the message's cumulative content is too large
-    # (both observed live 2026-07-05). Roll over comfortably before both.
+    # Proactive rollover thresholds, measured live 2026-07-05 via probe
+    # (ehoy scripts/carnie/slack_stream_probe.py): a stream dies ~306s after startStream
+    # even with appends every 20s — an ABSOLUTE lifetime, not inactivity —
+    # so roll at 240s (~80%, margin for jitter/slow appends). Cumulative
+    # size probed clean past 61,920 chars (earlier msg_too_long failures
+    # were single oversized chunks, since capped per-field), so the char
+    # threshold is a loose backstop, not the binding constraint.
     ROLLOVER_MAX_AGE_S = 240.0
-    ROLLOVER_MAX_CHARS = 10_000
+    ROLLOVER_MAX_CHARS = 40_000
     # Cap on accumulated 💭 reasoning text per card. 0 = uncapped, bounded
     # only by SLACK_FIELD_CEILING below.
     REASONING_MAX_CHARS = 0
