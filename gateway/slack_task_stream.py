@@ -272,11 +272,24 @@ class SlackTaskStream:
     retrying a broken stream on every subsequent event.
     """
 
+    # Tuning defaults (overridable per-instance via __init__, which run.py
+    # feeds from the display config keys tool_progress_native_*):
+    #
     # Proactive rollover thresholds: Slack kills streams at ~5 min and
     # bounces appends once the message's cumulative content is too large
     # (both observed live 2026-07-05). Roll over comfortably before both.
     ROLLOVER_MAX_AGE_S = 240.0
     ROLLOVER_MAX_CHARS = 10_000
+    # Cap on accumulated 💭 reasoning text per card. 0 = uncapped, bounded
+    # only by SLACK_FIELD_CEILING below.
+    REASONING_MAX_CHARS = 0
+    # Slack's documented limit for a markdown_text field is 12,000 chars;
+    # task_update details ride the same message budget. Absolute ceiling
+    # applied even when the user uncaps reasoning, so one card can't blow
+    # the whole message. (Rollover handles the cumulative budget.)
+    SLACK_FIELD_CEILING = 11_000
+    # Per-tool result preview length on finished cards.
+    OUTPUT_PREVIEW_CHARS = 120
     # Runaway guard: a turn pathological enough to need more fresh streams
     # than this should fall back to markdown instead. Sized generously —
     # age-based rollover alone consumes one per ~4 min, so a legitimate
@@ -291,6 +304,10 @@ class SlackTaskStream:
         task_display_mode: str = "plan",
         recipient_team_id: Optional[str] = None,
         recipient_user_id: Optional[str] = None,
+        rollover_age_s: Optional[float] = None,
+        rollover_chars: Optional[int] = None,
+        reasoning_chars: Optional[int] = None,
+        output_chars: Optional[int] = None,
     ) -> None:
         self.client = client
         self.channel = channel
@@ -298,6 +315,16 @@ class SlackTaskStream:
         self.recipient_team_id = recipient_team_id
         self.recipient_user_id = recipient_user_id
         self.task_display_mode = task_display_mode
+        # Config-driven tuning (None → class default). reasoning cap of 0
+        # means uncapped; it is still clamped to SLACK_FIELD_CEILING.
+        if rollover_age_s is not None and rollover_age_s > 0:
+            self.ROLLOVER_MAX_AGE_S = float(rollover_age_s)
+        if rollover_chars is not None and rollover_chars > 0:
+            self.ROLLOVER_MAX_CHARS = int(rollover_chars)
+        if reasoning_chars is not None:
+            self.REASONING_MAX_CHARS = max(0, int(reasoning_chars))
+        if output_chars is not None and output_chars > 0:
+            self.OUTPUT_PREVIEW_CHARS = int(output_chars)
         self.ts: Optional[str] = None
         self.disabled = False
         self._started = False
@@ -333,6 +360,9 @@ class SlackTaskStream:
         # the new card (their task ids don't exist there otherwise).
         self._stream_opened_at = 0.0
         self._sent_chars = 0
+        # Last-sent size per card id, for net-delta size accounting (a
+        # task_update replaces its card, so only growth counts).
+        self._chunk_sizes: dict = {}
         self._rollovers = 0
         self._in_progress: dict = {}  # task_id → last-sent chunk kwargs
         # Serializes the open: tool events arrive back-to-back and each
@@ -395,6 +425,7 @@ class SlackTaskStream:
             raise RuntimeError("chat.startStream returned no ts")
         self._stream_opened_at = time.monotonic()
         self._sent_chars = 0
+        self._chunk_sizes = {}
 
     async def task_started(
         self,
@@ -480,7 +511,8 @@ class SlackTaskStream:
         if not ok:
             title = f"{base} · ✗ failed"[:250]
         self._total_duration += duration or 0.0
-        out = str(output)[:150] if output else None
+        # +30 slack vs the run.py-side preview cap so a summary suffix fits.
+        out = str(output)[: self.OUTPUT_PREVIEW_CHARS + 30] if output else None
         # Re-send the start-time details so the collapsible content preview
         # (file body for Write/Edit, code for Run) survives the finish
         # update instead of being wiped by the card replacement.
@@ -585,11 +617,16 @@ class SlackTaskStream:
             self._reasoning_count += 1
             self._reasoning_open_id = f"think{self._reasoning_count}"
             self._reasoning_details = ""
-        # Details accumulate the full burst; keep the tail if it overflows
-        # (the freshest thinking is the part worth reading).
+        # Details accumulate the full burst; reasoning is the highest-value
+        # content on the card, so the default cap is 0 (uncapped). The
+        # effective ceiling is min(user cap or ∞, SLACK_FIELD_CEILING) —
+        # keep the tail on overflow (freshest thinking reads best).
         self._reasoning_details = (self._reasoning_details + " " + line).strip()
-        if len(self._reasoning_details) > 1500:
-            clipped = self._reasoning_details[-1500:]
+        cap = self.SLACK_FIELD_CEILING
+        if self.REASONING_MAX_CHARS > 0:
+            cap = min(self.REASONING_MAX_CHARS, cap)
+        if len(self._reasoning_details) > cap:
+            clipped = self._reasoning_details[-cap:]
             # Cut at the first word boundary inside the clip window.
             sp = clipped.find(" ")
             self._reasoning_details = "…" + clipped[sp + 1 if 0 <= sp < 40 else 0:]
@@ -718,8 +755,16 @@ class SlackTaskStream:
             ts=self.ts,
             chunks=[chunk],
         )
-        # Approximate the message-size budget by summing sent content.
-        self._sent_chars += sum(len(str(v)) for v in chunk.values())
+        # Approximate the message-size budget by NET RENDERED content: a
+        # task_update with a known id REPLACES that card, so count only the
+        # size delta vs what that card previously held. Summing raw appends
+        # would explode on 💭 cards (each update re-sends the whole
+        # accumulated burst) and trigger spurious rollovers.
+        size = sum(len(str(v)) for v in chunk.values())
+        key = chunk.get("id") or f"__{chunk.get('type', 'chunk')}__"
+        prev = self._chunk_sizes.get(key, 0)
+        self._chunk_sizes[key] = size
+        self._sent_chars += max(0, size - prev)
 
     async def _rollover_locked(self) -> None:
         """Close the current stream and continue on a fresh one.

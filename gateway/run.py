@@ -16848,6 +16848,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         ),
                         recipient_team_id=_stream_team_id,
                         recipient_user_id=getattr(source, "user_id", None),
+                        # Tuning knobs — standard display-config resolution
+                        # (display.platforms.slack.<key> → display.<key> →
+                        # built-in default), so users adjust them like any
+                        # other Hermes display parameter.
+                        rollover_age_s=resolve_display_setting(
+                            user_config, platform_key, "tool_progress_native_rollover_age_s",
+                        ),
+                        rollover_chars=resolve_display_setting(
+                            user_config, platform_key, "tool_progress_native_rollover_chars",
+                        ),
+                        reasoning_chars=resolve_display_setting(
+                            user_config, platform_key, "tool_progress_native_reasoning_chars",
+                        ),
+                        output_chars=resolve_display_setting(
+                            user_config, platform_key, "tool_progress_native_output_chars",
+                        ),
                     )
                 else:
                     _slack_native_cards = False
@@ -16914,11 +16930,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # the JSON envelope + collapse whitespace so it reads as a
                 # glanceable summary. Kept SHORT (Minh 2026-07-05: tool
                 # previews are mostly clutter; the reasoning cards are the
-                # signal) — also buys message-size budget for reasoning.
+                # signal). Cap is config-driven
+                # (display.*.tool_progress_native_output_chars).
+                _out_cap = getattr(_slack_task_stream, "OUTPUT_PREVIEW_CHARS", 120)
                 try:
-                    output = _sts.clean_output_preview(_result, limit=120)
+                    output = _sts.clean_output_preview(_result, limit=_out_cap)
                 except Exception:
-                    output = _result.strip()[:120] if isinstance(_result, str) and _result.strip() else None
+                    output = _result.strip()[:_out_cap] if isinstance(_result, str) and _result.strip() else None
                 # MCP tools report failures as result TEXT with is_error
                 # False — sniff those so a 403 doesn't render with a ✓.
                 if ok and _sts.result_looks_like_error(_result):
