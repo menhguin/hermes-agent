@@ -16903,6 +16903,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             from gateway import slack_task_stream as _sts
             if event_type == "tool.started":
+                # Drain any reasoning still sitting in the 2s throttle
+                # buffer BEFORE scheduling the tool card. The model always
+                # finishes its reasoning before emitting a tool call, so
+                # by the time this event fires the full thought exists —
+                # but up to 2s of its tail can be waiting out the throttle
+                # window. Without this drain, that tail flushes AFTER the
+                # tool card and rides on a fresh 💭 card, splitting the
+                # thought across the Exec entry (observed live 2026-07-06).
+                # The stream's FIFO send lock preserves schedule order, so
+                # draining first guarantees thought ✓ → tool on the card.
+                _pending = _slack_reasoning_buf[0].strip()
+                _slack_reasoning_buf[0] = ""
+                _slack_reasoning_last[0] = time.monotonic()
+                if _pending:
+                    _fut = safe_schedule_threadsafe(
+                        _slack_task_stream.reasoning_update(_pending),
+                        _voice_ack_loop,
+                        logger=logger,
+                        log_message="slack reasoning drain scheduling error",
+                    )
+                    if _fut is not None:
+                        _slack_task_futures.append(_fut)
                 index = _slack_task_index[0]
                 _slack_task_index[0] += 1
                 _slack_task_pending.setdefault(tool_name, []).append(index)
