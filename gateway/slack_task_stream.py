@@ -388,11 +388,10 @@ class SlackTaskStream:
         # for the auto-generated header ("Searched · edited files · …").
         self._categories: list[str] = []
         self._last_header: str = ""
-        # Descriptive title and details per task id, so the finish update can
-        # reuse them instead of wiping (a task_update with the same id
-        # REPLACES the card wholesale — omitted fields vanish).
+        # Start-time title per task id: the finish update falls back to it
+        # when no descriptive summary is available (title REPLACES on each
+        # task_update; details APPENDS — see module docstring).
         self._titles: dict[int, str] = {}
-        self._details: dict[int, str] = {}
         # Interleaved reasoning cards: each burst of thinking between tool
         # calls gets its own 💭 card in the timeline (updated in place while
         # the burst continues, finalized when the next tool starts). The
@@ -503,8 +502,6 @@ class SlackTaskStream:
         title = f"{label} — {preview}" if preview else label
         title = title[:250]
         self._titles[index] = title
-        if details:
-            self._details[index] = details
         self._task_count += 1
         # Track tool categories for the auto-generated turn header.
         cat = tool_category(tool_name)
