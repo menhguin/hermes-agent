@@ -95,6 +95,35 @@ def _word_trim(text: str, limit: int) -> str:
     return cut.rstrip() + "…"
 
 
+def _merge_reasoning(acc: str, incoming: str, probe: int = 200) -> str:
+    """Merge a new reasoning flush into the accumulated burst, dedup-aware.
+
+    Providers differ in what a "reasoning delta" contains: true deltas
+    (new tokens only), cumulative snapshots (entire reasoning so far), or
+    overlapping windows (tail of previous flush + new tokens). Naive
+    concatenation renders duplicated sentences on the 💭 card for the
+    latter two (observed live 2026-07-05: same sentence 4×).
+
+    Strategy: (1) if one side contains the other, keep the superset;
+    (2) otherwise find the longest suffix of ``acc`` that prefixes
+    ``incoming`` (checked down from ``probe`` chars) and splice at the
+    overlap; (3) no overlap → plain append.
+    """
+    if not acc:
+        return incoming.strip()
+    if not incoming:
+        return acc
+    if incoming in acc:
+        return acc
+    if acc in incoming:
+        return incoming.strip()
+    max_k = min(len(acc), len(incoming), probe)
+    for k in range(max_k, 9, -1):  # overlaps <10 chars are coincidence
+        if acc.endswith(incoming[:k]):
+            return acc + incoming[k:]
+    return (acc + " " + incoming).strip()
+
+
 def clean_output_preview(result: Any, limit: int = 300) -> Optional[str]:
     """Turn a raw tool result into a compact, human-readable card preview.
 
@@ -625,7 +654,12 @@ class SlackTaskStream:
         # content on the card, so the default cap is 0 (uncapped). The
         # effective ceiling is min(user cap or ∞, SLACK_FIELD_CEILING) —
         # keep the tail on overflow (freshest thinking reads best).
-        self._reasoning_details = (self._reasoning_details + " " + line).strip()
+        #
+        # Overlap-aware merge: some providers deliver reasoning as
+        # CUMULATIVE snapshots (full text so far) rather than deltas, and
+        # thread-timing can re-deliver overlapping windows. Naive append
+        # rendered the same sentences 3-4× (observed live 2026-07-05).
+        self._reasoning_details = _merge_reasoning(self._reasoning_details, line)
         cap = self.SLACK_FIELD_CEILING
         if self.REASONING_MAX_CHARS > 0:
             cap = min(self.REASONING_MAX_CHARS, cap)
@@ -783,6 +817,23 @@ class SlackTaskStream:
         if self._rollovers > self.MAX_ROLLOVERS:
             raise RuntimeError(f"exceeded {self.MAX_ROLLOVERS} stream rollovers this turn")
         try:
+            # Settle still-open tasks on the OLD card before closing it —
+            # stopping a stream with in_progress tasks makes Slack stamp
+            # them with red warning triangles ("something went wrong"),
+            # which reads as breakage when it's just a continuation
+            # (observed live 2026-07-05). Mark them complete with a ⤵
+            # suffix here; they're replayed as in_progress on the fresh
+            # card below.
+            for tid, chunk in list(self._in_progress.items()):
+                settled = dict(chunk)
+                settled["status"] = "complete"
+                settled["title"] = f"{str(chunk.get('title', ''))[:240]} ⤵"
+                try:
+                    await self.client.chat_appendStream(
+                        channel=self.channel, ts=self.ts, chunks=[settled],
+                    )
+                except Exception:
+                    break  # old stream already dead — skip the rest
             await self.client.chat_stopStream(
                 channel=self.channel,
                 ts=self.ts,
