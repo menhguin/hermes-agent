@@ -370,6 +370,7 @@ class SlackTaskStream:
         self._reasoning_open_id: Optional[str] = None
         self._reasoning_title: str = ""
         self._reasoning_details: str = ""
+        self._reasoning_unsent: str = ""
         self._reasoning_count = 0
         # Per-subagent state (card id → {tools, number, start-time}) for the
         # numbered, timed delegate cards.
@@ -533,12 +534,12 @@ class SlackTaskStream:
         self._total_duration += duration or 0.0
         # +30 slack vs the run.py-side preview cap so a summary suffix fits.
         out = str(output)[: self.OUTPUT_PREVIEW_CHARS + 30] if output else None
-        # Re-send the start-time details so the collapsible content preview
-        # (file body for Write/Edit, code for Run) survives the finish
-        # update instead of being wiped by the card replacement.
+        # details APPEND server-side (measured 2026-07-05), so the start-time
+        # content preview persists on its own — re-sending it here would
+        # duplicate it. Send no details on the finish update.
         await self._append_task_update(
             index, title, status="complete",
-            details=self._details.get(index), output=out, sources=sources,
+            output=out, sources=sources,
         )
 
     async def subagent_event(
@@ -592,16 +593,17 @@ class SlackTaskStream:
             await self._append_raw_task(sid, _title(), status="in_progress")
         elif event_type == "subagent.tool" and tool_name:
             st["tools"].append(tool_label(tool_name))
-            details = " → ".join(st["tools"][-12:])[:500]
+            # details APPEND server-side — send only the new tool label and
+            # let Slack accumulate the trail ("A → B → C" grows one arrow
+            # per update instead of re-sending the whole trail).
+            step = tool_label(tool_name)
+            delta = step if len(st["tools"]) == 1 else f" → {step}"
             await self._append_raw_task(
-                sid, _title(), status="in_progress", details=details,
+                sid, _title(), status="in_progress", details=delta,
             )
         elif event_type == "subagent.complete":
-            details = " → ".join(st["tools"][-12:])[:500] if st["tools"] else None
             suffix = "" if ok else " · ✗ failed"
-            await self._append_raw_task(
-                sid, _title(suffix), status="complete", details=details,
-            )
+            await self._append_raw_task(sid, _title(suffix), status="complete")
 
     async def reasoning_update(self, text: str) -> None:
         """Render the model's thinking as interleaved 💭 cards in the timeline.
@@ -640,13 +642,18 @@ class SlackTaskStream:
             self._reasoning_open_id = f"think{self._reasoning_count}"
             self._reasoning_details = ""
             self._reasoning_title = ""
-        # Details accumulate the full burst — inputs are true deltas (the
-        # agent's post-completion full-text re-fire is latched off; see
-        # _reasoning_streamed_this_response in agent/chat_completion_helpers)
-        # so plain append is correct. Reasoning is the highest-value card
-        # content: default cap 0 (uncapped), effective ceiling
-        # min(user cap or ∞, SLACK_FIELD_CEILING), tail kept on overflow.
+            self._reasoning_unsent = ""
+        # ``details`` APPENDS across task_update chunks with the same id —
+        # measured live 2026-07-05 (probe: two updates "AAA"/"BBB" stored
+        # as "AAABBB"); title/status REPLACE. So each flush must send ONLY
+        # the not-yet-sent delta, and Slack accumulates server-side.
+        # Sending the full running text each flush rendered the
+        # burst₁+(burst₁+burst₂)+… staircase duplication.
+        # _reasoning_details keeps the full local copy (rollover replay +
+        # finalize-before-stream-opens need it); _reasoning_unsent is the
+        # pending tail.
         self._reasoning_details = (self._reasoning_details + " " + line).strip()
+        self._reasoning_unsent = (self._reasoning_unsent + " " + line).strip()
         cap = self.SLACK_FIELD_CEILING
         if self.REASONING_MAX_CHARS > 0:
             cap = min(self.REASONING_MAX_CHARS, cap)
@@ -667,22 +674,30 @@ class SlackTaskStream:
             self._reasoning_title = f"💭 {_word_trim(head, 80)}"[:250]
         if not self._started:
             return  # buffered — flushed by the first task_started
+        delta, self._reasoning_unsent = self._reasoning_unsent, ""
+        if not delta:
+            return
         await self._append_raw_task(
             self._reasoning_open_id, self._reasoning_title,
-            status="in_progress", details=self._reasoning_details,
+            status="in_progress", details=" " + delta,
         )
 
     async def _finalize_reasoning_card(self) -> None:
-        """Mark the open 💭 card complete (called when the next tool starts)."""
+        """Mark the open 💭 card complete (called when the next tool starts).
+
+        Sends only the still-unsent tail of the burst (details APPEND
+        server-side; re-sending the full text would duplicate it). In the
+        buffered pre-stream case nothing has been sent yet, so the unsent
+        tail IS the full burst — correct either way.
+        """
         if self._reasoning_open_id is None:
             return
-        rid, title, details = (
-            self._reasoning_open_id, self._reasoning_title, self._reasoning_details,
-        )
+        rid, title = self._reasoning_open_id, self._reasoning_title
+        tail, self._reasoning_unsent = self._reasoning_unsent, ""
         self._reasoning_open_id = None
         self._reasoning_details = ""
         await self._append_raw_task(
-            rid, title, status="complete", details=details or None,
+            rid, title, status="complete", details=(" " + tail) if tail else None,
         )
 
     async def set_plan_title(self, title: str) -> None:
@@ -840,10 +855,23 @@ class SlackTaskStream:
             self.ts, self._rollovers,
         )
         # Replay the turn header and any in-flight tasks on the new card.
+        # The fresh card starts empty, so replayed chunks need FULL content:
+        # for the open 💭 card the tracked chunk only carries the last sent
+        # delta (details append server-side) — substitute the full local
+        # accumulated burst.
         replay: List[dict] = []
         if self._last_header:
             replay.append({"type": "plan_update", "title": self._last_header[:250]})
-        replay.extend(dict(c) for c in self._in_progress.values())
+        for c in self._in_progress.values():
+            chunk = dict(c)
+            if (
+                self._reasoning_open_id is not None
+                and chunk.get("id") == self._reasoning_open_id
+                and self._reasoning_details
+            ):
+                chunk["details"] = self._reasoning_details
+                self._reasoning_unsent = ""
+            replay.append(chunk)
         for chunk in replay:
             await self._send_chunk_locked(chunk)
 
