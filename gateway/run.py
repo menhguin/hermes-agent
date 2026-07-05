@@ -17885,10 +17885,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.tool_progress_callback = (
                 progress_callback if (needs_progress_queue or log_mode_enabled) else None
             )
-            # Slack native task cards: stream reasoning deltas into the card
-            # header ("💭 latest thought"). Only wired when cards are active
-            # for this turn — reasoning_callback is otherwise unused by the
-            # gateway, so this is strictly additive.
+            # Slack native task cards: stream reasoning deltas into
+            # interleaved 💭 cards on the task stream. Only wired when cards
+            # are active for this turn — reasoning_callback is otherwise
+            # unused by the gateway, so this is strictly additive.
             if _slack_native_cards and _slack_task_stream is not None:
                 agent.reasoning_callback = _slack_reasoning_event
             # Discord voice verbal-ack hook (fires once per turn on first tool
