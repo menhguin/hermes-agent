@@ -61,7 +61,7 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress_native_rollover_age_s": 240,
     "tool_progress_native_rollover_chars": 40_000,
     "tool_progress_native_reasoning_chars": 0,
-    "tool_progress_native_output_chars": 120,
+    "tool_progress_native_output_chars": 0,
     "show_reasoning": False,
     # How a reasoning/thinking summary is rendered when show_reasoning is on.
     #   "code"      -> 💭 **Reasoning:** + fenced code block (legacy default)

@@ -17101,11 +17101,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Settle the start entry (0) and each tool entry (1..n).
                     for i in range(n + 1):
                         await s.task_finished(i, "step", 0.0, okv)
-                    # New final entry carries the child's result summary.
-                    await s.task_started(n + 1, "delegate_task", "result")
+                    # New final entry carries the child's result summary in
+                    # DETAILS (not output — output previews can be disabled
+                    # via output_chars=0, and the summary must survive that).
+                    await s.task_started(
+                        n + 1, "delegate_task", "result",
+                        details=summ or None,
+                    )
                     await s.task_finished(
                         n + 1, "delegate_task", dur, okv,
-                        output=summ or None,
                         summary="✅ completed" if okv else "failed",
                     )
                     await s.stop()

@@ -341,8 +341,11 @@ class SlackTaskStream:
     # burst has substance. A pending fragment below this at finalize time
     # is carried into the next burst rather than emitted as its own card.
     REASONING_MIN_CHARS = 40
-    # Per-tool result preview length on finished cards.
-    OUTPUT_PREVIEW_CHARS = 120
+    # Per-tool result preview length on finished cards. 0 (default) =
+    # no output previews — per Minh 2026-07-06: output previews get
+    # skimmed past; reasoning is the signal. Set
+    # tool_progress_native_output_chars to re-enable.
+    OUTPUT_PREVIEW_CHARS = 0
     # Runaway guard: a turn pathological enough to need more fresh streams
     # than this should fall back to markdown instead. Sized generously —
     # age-based rollover alone consumes one per ~4 min, so a legitimate
@@ -575,7 +578,11 @@ class SlackTaskStream:
             title = f"{base} · ✗ failed"[:250]
         self._total_duration += duration or 0.0
         # +30 slack vs the run.py-side preview cap so a summary suffix fits.
-        out = str(output)[: self.OUTPUT_PREVIEW_CHARS + 30] if output else None
+        # OUTPUT_PREVIEW_CHARS <= 0 disables output previews entirely.
+        if self.OUTPUT_PREVIEW_CHARS <= 0:
+            out = None
+        else:
+            out = str(output)[: self.OUTPUT_PREVIEW_CHARS + 30] if output else None
         # details APPEND server-side (measured 2026-07-05), so the start-time
         # content preview persists on its own — re-sending it here would
         # duplicate it. Send no details on the finish update.
