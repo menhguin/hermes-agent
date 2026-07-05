@@ -17079,7 +17079,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             elif event_type == "subagent.tool" and tool_name:
                 idx = _slack_subagent_tool_idx.get(key, 0) + 1
                 _slack_subagent_tool_idx[key] = idx
-                coro = sub.task_started(idx, str(tool_name), None)
+                # preview carries the child tool's arg summary (same string
+                # the main card shows) — full detail parity with main.
+                coro = sub.task_started(idx, str(tool_name), preview)
             elif event_type == "subagent.complete":
                 # Settle every entry, put the child's result summary on the
                 # final entry (the relay carries summary/duration/status —
