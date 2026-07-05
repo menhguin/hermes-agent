@@ -17086,7 +17086,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Settle every entry, put the child's result summary on the
                 # final entry (the relay carries summary/duration/status —
                 # user-visible output was the missing piece), then close.
-                _summary = str(kwargs.get("summary") or kwargs.get("preview") or "")[:400]
+                # Sanitize: summaries beginning with a markdown heading
+                # ("## Summary") rendered as an EMPTY output bullet on the
+                # card (observed A/B 2026-07-06 round 2: bold-first summary
+                # rendered, heading-first summary vanished) — strip heading
+                # markers and collapse newlines before sending.
+                _summary = str(kwargs.get("summary") or kwargs.get("preview") or "")
+                _summary = re.sub(r"^\s*#{1,6}\s*", "", _summary)
+                _summary = " ".join(_summary.split())[:400]
                 _dur = float(kwargs.get("duration_seconds") or 0.0)
 
                 async def _finish(s=sub, okv=ok, k=key, summ=_summary, dur=_dur):
