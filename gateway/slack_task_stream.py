@@ -188,6 +188,30 @@ def tool_category(tool_name: str) -> Optional[str]:
     return meta[1] if meta else None
 
 
+def _split_complete_sentences(text: str) -> tuple[str, str]:
+    """Split ``text`` into (complete sentences, trailing incomplete tail).
+
+    Used to flush reasoning at sentence boundaries: the flush timer and
+    tool-call finalize land at arbitrary stream positions, and cutting
+    there splits a sentence across two 💭 cards (observed live: card N
+    ending "…cron reminders.Both" with the sentence continuing on card
+    N+1). The last sentence-terminating punctuation wins; everything
+    after it is the held tail.
+    """
+    best = -1
+    for sep in (". ", "! ", "? ", ".\n", "!\n", "?\n"):
+        idx = text.rfind(sep)
+        if idx > best:
+            best = idx
+    if best < 0:
+        # Terminal punctuation at the very end counts as complete.
+        if text.rstrip().endswith((".", "!", "?", ":")):
+            return text, ""
+        return "", text
+    cut = best + 1  # include the punctuation, not the following space
+    return text[:cut], text[cut:].lstrip()
+
+
 def tool_details_from_args(tool_name: str, args: Any) -> Optional[str]:
     """Optional collapsible-body preview extracted from the tool's args."""
     key = _CONTENT_ARG_BY_TOOL.get(tool_name)
@@ -692,22 +716,29 @@ class SlackTaskStream:
             self._reasoning_title = f"💭 {_word_trim(head, 80)}"[:250]
         if not self._started:
             return  # buffered — flushed by the first task_started
-        delta, self._reasoning_unsent = self._reasoning_unsent, ""
-        if not delta:
+        # Flush at sentence boundaries only: send the complete-sentence
+        # prefix of the unsent buffer, hold the incomplete tail for the
+        # next flush (or the finalize/carry path). Cutting at raw timer
+        # positions split sentences across cards. Join with a TRAILING
+        # space — probe #4: Slack preserves trailing whitespace at chunk
+        # joins but strips leading whitespace at some element boundaries
+        # (the "reminders.Both" jam).
+        sendable, tail = _split_complete_sentences(self._reasoning_unsent)
+        if not sendable:
             return
+        self._reasoning_unsent = tail
         await self._append_raw_task(
             self._reasoning_open_id, self._reasoning_title,
-            status="in_progress", details=" " + delta,
+            status="in_progress", details=sendable.rstrip() + " ",
         )
 
     async def _finalize_reasoning_card(self) -> None:
         """Settle the open 💭 card when the next tool starts.
 
-        Sub-threshold bursts (< REASONING_MIN_CHARS, e.g. a mid-word "I"
-        sliced off by the flush timer) never made it onto the card — carry
-        them into the next burst instead of emitting a fragment card.
-        Otherwise mark complete, sending only the still-unsent tail
-        (details APPEND server-side; re-sending duplicates).
+        Sends any still-unsent text (complete or not — the burst is over,
+        so the remainder belongs to THIS card; only sub-threshold bursts
+        that never rendered are carried into the next burst instead of
+        emitting a fragment card).
         """
         if self._reasoning_open_id is None:
             return
@@ -723,7 +754,8 @@ class SlackTaskStream:
         self._reasoning_open_id = None
         self._reasoning_details = ""
         await self._append_raw_task(
-            rid, title, status="complete", details=(" " + tail) if tail else None,
+            rid, title, status="complete",
+            details=(tail.rstrip() + " ") if tail.strip() else None,
         )
 
     async def set_plan_title(self, title: str) -> None:
