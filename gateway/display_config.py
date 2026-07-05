@@ -33,6 +33,16 @@ from typing import Any
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
+    # Opt-in: render tool progress as Slack's native "Thinking Steps" task
+    # cards (chat.startStream/appendStream/stopStream) instead of markdown
+    # progress bubbles. Only takes effect on Slack; every other platform
+    # ignores this key. Off by default — additive, not a behavior change.
+    "tool_progress_native": False,
+    # Card layout for native task cards: "plan" groups all tasks into one
+    # collapsible card (default — reads cleanest, prose lands below it),
+    # "timeline" gives each task its own separate card block, "dense"
+    # collapses consecutive tool calls. Fixed at stream start (Slack limit).
+    "tool_progress_native_mode": "plan",
     "show_reasoning": False,
     # How a reasoning/thinking summary is rendered when show_reasoning is on.
     #   "code"      -> 💭 **Reasoning:** + fenced code block (legacy default)
@@ -240,6 +250,7 @@ def _normalise(setting: str, value: Any) -> Any:
         "interim_assistant_messages",
         "long_running_notifications",
         "busy_ack_detail",
+        "tool_progress_native",
     }:
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes", "on"}
@@ -251,6 +262,9 @@ def _normalise(setting: str, value: Any) -> Any:
     if setting == "tool_progress_grouping":
         val = str(value).lower()
         return val if val in ("accumulate", "separate") else "accumulate"
+    if setting == "tool_progress_native_mode":
+        val = str(value).lower()
+        return val if val in ("plan", "timeline", "dense") else "plan"
     if setting == "reasoning_style":
         val = str(value).lower()
         return val if val in ("code", "blockquote", "subtext") else "code"

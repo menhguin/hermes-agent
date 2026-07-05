@@ -489,6 +489,29 @@ def _resolve_progress_thread_id(platform: Any, source_thread_id: Any, event_mess
     return None
 
 
+def _resolve_slack_native_task_cards(
+    user_config: dict,
+    platform_key: str,
+    platform: Any,
+    tool_progress_enabled: bool,
+    thread_id: Optional[str],
+) -> bool:
+    """True when Slack-native "Thinking Steps" task cards should replace the
+    markdown tool-progress bubbles for this turn.
+
+    Opt-in (``display.platforms.slack.tool_progress_native``) and strictly
+    additive: requires tool progress to already be enabled, the platform to
+    be Slack, and a thread target (``chat.startStream`` requires
+    ``thread_ts``). Every other platform, and Slack installs that don't set
+    the flag, are unaffected.
+    """
+    from gateway.config import Platform
+    if not tool_progress_enabled or platform != Platform.SLACK or not thread_id:
+        return False
+    from gateway.display_config import resolve_display_setting
+    return bool(resolve_display_setting(user_config, platform_key, "tool_progress_native"))
+
+
 def _has_platform_display_override(user_config: dict, platform_key: str, setting: str) -> bool:
     """Return True when display.platforms.<platform> explicitly sets setting."""
     display = user_config.get("display") if isinstance(user_config, dict) else None
@@ -16515,6 +16538,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not progress_queue or not _run_still_current():
                 return
 
+            # Slack-native task cards: route tool.started/tool.completed onto
+            # the SlackTaskStream INSTEAD of the markdown progress bubbles.
+            # MUST run before the onboarding-hint block below — that block
+            # unconditionally returns on every tool.completed event (the
+            # markdown path only renders tool.started), which would swallow
+            # completions and leave every card stuck at in_progress (Slack
+            # then closes the stream as "Something went wrong"). Any
+            # unexpected exception falls through to markdown (never
+            # propagate: this callback runs on every tool event).
+            try:
+                if (
+                    _slack_native_cards
+                    and tool_progress_enabled
+                    and _slack_task_stream is not None
+                    and not _slack_task_stream.disabled
+                ):
+                    if event_type in {"tool.started", "tool.completed"}:
+                        _slack_task_event(event_type, tool_name, preview, args, kwargs)
+                        return
+                    if event_type in {"subagent.start", "subagent.tool", "subagent.complete"}:
+                        _slack_subagent_event(event_type, tool_name, preview, kwargs)
+                        return
+            except Exception:
+                logger.warning(
+                    "Slack native task-card event failed; falling back to markdown progress",
+                    exc_info=True,
+                )
+
             # First-touch onboarding: the first time a tool takes longer than
             # _LONG_TOOL_THRESHOLD_S during a run that's streaming every tool
             # (progress_mode == "all"), append a one-time hint suggesting
@@ -16738,6 +16789,231 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
             else None
         )
+
+        # Slack-native "Thinking Steps" task cards (opt-in, additive — see
+        # gateway/slack_task_stream.py). When enabled, tool-start/finish
+        # events are routed to a SlackTaskStream instead of the markdown
+        # progress bubbles built above. Constructed lazily on the first tool
+        # event so a turn with no tool calls never opens a stream.
+        #
+        # SAFETY: this block executes on EVERY turn once the flag is on for a
+        # channel, so it must be impossible for it to raise — an exception
+        # here crash-loops the whole thread (2026-07-05 incident: an
+        # UnboundLocalError in this block took Slack down until a manual
+        # restore). Everything is wrapped; on any failure we fall back to the
+        # markdown progress path.
+        _slack_native_cards = False
+        _slack_task_stream = None  # type: Optional["SlackTaskStream"]
+        try:
+            _slack_native_cards = _resolve_slack_native_task_cards(
+                user_config, platform_key, source.platform, tool_progress_enabled, _progress_thread_id,
+            )
+            if _slack_native_cards:
+                _slack_adapter = self.adapters.get(source.platform)
+                _slack_client = getattr(_slack_adapter, "_get_client", None)
+                if callable(_slack_client):
+                    try:
+                        _slack_client = _slack_client(source.chat_id)
+                    except Exception:
+                        _slack_client = None
+                else:
+                    _slack_client = None
+                if _slack_client is not None:
+                    from gateway.slack_task_stream import SlackTaskStream
+                    # Slack requires recipient_team_id for bot-token streams
+                    # (missing_recipient_team_id otherwise). Resolution order:
+                    # 1. adapter's chat→workspace map (only populated on the
+                    #    assistant-thread metadata path, so often empty for
+                    #    plain channel messages),
+                    # 2. the adapter's registered workspaces — when exactly
+                    #    one bot token is connected its team_id is
+                    #    unambiguous (the common single-workspace install),
+                    # 3. the inbound message's workspace scope, if set.
+                    # NOTE: _slack_adapter (fetched above) is the only
+                    # adapter handle in scope here — _status_adapter is not
+                    # assigned until later in this function and referencing
+                    # it raises UnboundLocalError.
+                    _team_clients = getattr(_slack_adapter, "_team_clients", None) or {}
+                    _stream_team_id = (
+                        (getattr(_slack_adapter, "_channel_team", None) or {}).get(source.chat_id)
+                        or (next(iter(_team_clients)) if len(_team_clients) == 1 else None)
+                        or getattr(source, "scope_id", None)
+                    )
+                    _slack_task_stream = SlackTaskStream(
+                        _slack_client, source.chat_id, str(_progress_thread_id),
+                        task_display_mode=str(
+                            resolve_display_setting(
+                                user_config, platform_key, "tool_progress_native_mode",
+                            ) or "plan"
+                        ),
+                        recipient_team_id=_stream_team_id,
+                        recipient_user_id=getattr(source, "user_id", None),
+                    )
+                else:
+                    _slack_native_cards = False
+        except Exception:
+            logger.warning(
+                "Slack native task-card setup failed; falling back to markdown progress",
+                exc_info=True,
+            )
+            _slack_native_cards = False
+            _slack_task_stream = None
+        # Monotonic per-turn tool-call index for correlating task_started with
+        # task_finished on the same SlackTaskStream card (mirrors
+        # stream_events.ToolCallChunk.index). Tool completions don't carry the
+        # index the start event got, so track a FIFO queue of assigned indices
+        # per tool name — good enough for the common case of at most one
+        # in-flight call per tool name; parallel duplicate-name calls may pair
+        # slightly out of order, which only affects which card updates first.
+        _slack_task_index = [0]
+        _slack_task_pending: Dict[str, List[int]] = {}
+        # Futures for scheduled card updates, drained before stop(): the
+        # events are fire-and-forget coroutines, so without an explicit
+        # drain the turn's finally can call chat.stopStream while the last
+        # task_finished updates are still queued — Slack then renders the
+        # stuck-in_progress tasks with warning icons.
+        _slack_task_futures: List[Any] = []
+
+        def _slack_task_event(event_type: str, tool_name: str, preview, args, kwargs) -> None:
+            """Route a tool lifecycle event onto the Slack native task stream.
+
+            Presentation logic (labels, previews, summaries, sources, error
+            sniffing) lives in gateway.slack_task_stream helpers; this
+            function only correlates events and schedules the coroutines.
+            Each helper call is individually guarded — a presentation bug
+            must never lose the card update itself.
+            """
+            if _slack_task_stream is None or _slack_task_stream.disabled:
+                return
+            from gateway import slack_task_stream as _sts
+            if event_type == "tool.started":
+                index = _slack_task_index[0]
+                _slack_task_index[0] += 1
+                _slack_task_pending.setdefault(tool_name, []).append(index)
+                # Content-bearing tools (write_file/patch/execute_code) get a
+                # snippet of their payload in the collapsible card body.
+                try:
+                    _details = _sts.tool_details_from_args(tool_name, args)
+                except Exception:
+                    _details = None
+                _fut = safe_schedule_threadsafe(
+                    _slack_task_stream.task_started(index, tool_name, preview, details=_details),
+                    _voice_ack_loop,
+                    logger=logger,
+                    log_message="slack task_started scheduling error",
+                )
+                if _fut is not None:
+                    _slack_task_futures.append(_fut)
+            elif event_type == "tool.completed":
+                pending = _slack_task_pending.get(tool_name)
+                index = pending.pop(0) if pending else 0
+                duration = kwargs.get("duration") or 0.0
+                ok = not kwargs.get("is_error", False)
+                _result = kwargs.get("result")
+                # Short result preview for the expanded card body — unwrap
+                # the JSON envelope + collapse whitespace so it reads as a
+                # glanceable summary, not a raw {"output": "..."} dump.
+                try:
+                    output = _sts.clean_output_preview(_result, limit=300)
+                except Exception:
+                    output = _result.strip()[:300] if isinstance(_result, str) and _result.strip() else None
+                # MCP tools report failures as result TEXT with is_error
+                # False — sniff those so a 403 doesn't render with a ✓.
+                if ok and _sts.result_looks_like_error(_result):
+                    ok = False
+                # A descriptive completion title ("Web search → 5 results
+                # for X") beats the raw arg echo. Falls back to the start
+                # title when the summarizer has nothing better.
+                try:
+                    _summary = _sts.summarize_tool_title(tool_name, args, _result)
+                except Exception:
+                    _summary = None
+                # Clickable URL chips for web tools (search hits, fetched
+                # pages) via the task_update ``sources`` field.
+                try:
+                    _sources = _sts.tool_sources(tool_name, args, _result)
+                except Exception:
+                    _sources = None
+                _fut = safe_schedule_threadsafe(
+                    _slack_task_stream.task_finished(
+                        index, tool_name, duration, ok,
+                        output=output, sources=_sources, summary=_summary,
+                    ),
+                    _voice_ack_loop,
+                    logger=logger,
+                    log_message="slack task_finished scheduling error",
+                )
+                if _fut is not None:
+                    _slack_task_futures.append(_fut)
+
+        def _slack_subagent_event(event_type: str, tool_name, preview, kwargs) -> None:
+            """Route delegate_task child lifecycle events onto subagent cards.
+
+            Relayed by _build_child_progress_callback with identity kwargs
+            (subagent_id, goal, task_index...). tool_name carries the child's
+            tool for subagent.tool events.
+            """
+            if _slack_task_stream is None or _slack_task_stream.disabled:
+                return
+            key = str(
+                kwargs.get("subagent_id")
+                or kwargs.get("task_index")
+                or "0"
+            )
+            # Stable 1-based number for the card ("#1", "#2"): task_index is
+            # 0-based in a batch; +1 for display. Falls back to None (no
+            # number shown) when the relay didn't carry a task_index.
+            _ti = kwargs.get("task_index")
+            number = (_ti + 1) if isinstance(_ti, int) else None
+            goal = str(kwargs.get("goal") or preview or "")
+            ok = "error" not in str(kwargs.get("status") or "").lower()
+            _fut = safe_schedule_threadsafe(
+                _slack_task_stream.subagent_event(
+                    event_type, key, goal=goal, tool_name=tool_name, ok=ok, number=number,
+                ),
+                _voice_ack_loop,
+                logger=logger,
+                log_message="slack subagent card scheduling error",
+            )
+            if _fut is not None:
+                _slack_task_futures.append(_fut)
+
+        # Reasoning → card header: throttle raw reasoning deltas into a
+        # rolling "💭 <latest thought>" plan_update. Deltas arrive token-by-
+        # token and plan_update replaces the header wholesale, so we buffer
+        # and flush at most once per interval, showing the tail line.
+        _slack_reasoning_buf = [""]
+        _slack_reasoning_last = [0.0]
+        _SLACK_REASONING_INTERVAL_S = 2.0
+
+        def _slack_reasoning_event(text: str) -> None:
+            """agent.reasoning_callback consumer (worker thread, sync)."""
+            if _slack_task_stream is None or _slack_task_stream.disabled:
+                return
+            if not isinstance(text, str) or not text:
+                return
+            _slack_reasoning_buf[0] = (_slack_reasoning_buf[0] + text)[-600:]
+            now = time.monotonic()
+            if now - _slack_reasoning_last[0] < _SLACK_REASONING_INTERVAL_S:
+                return
+            _slack_reasoning_last[0] = now
+            # Render the last sentence-ish fragment of the buffer.
+            tail = _slack_reasoning_buf[0].replace("\n", " ").strip()
+            for sep in (". ", "! ", "? "):
+                if sep in tail:
+                    tail = tail.rsplit(sep, 1)[-1]
+            if not tail:
+                return
+            _fut = safe_schedule_threadsafe(
+                _slack_task_stream.reasoning_update(tail),
+                _voice_ack_loop,
+                logger=logger,
+                log_message="slack reasoning_update scheduling error",
+            )
+            # Tracked like task updates so the turn's finally drains it —
+            # an undrained reasoning append can race chat.stopStream.
+            if _fut is not None:
+                _slack_task_futures.append(_fut)
 
         async def write_tool_log():
             """Drain log_queue and append tool-call lines to tool_calls.log.
@@ -17591,6 +17867,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.tool_progress_callback = (
                 progress_callback if (needs_progress_queue or log_mode_enabled) else None
             )
+            # Slack native task cards: stream reasoning deltas into the card
+            # header ("💭 latest thought"). Only wired when cards are active
+            # for this turn — reasoning_callback is otherwise unused by the
+            # gateway, so this is strictly additive.
+            if _slack_native_cards and _slack_task_stream is not None:
+                agent.reasoning_callback = _slack_reasoning_event
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).
             agent.tool_start_callback = (
@@ -19198,6 +19480,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 log_task.cancel()
             interrupt_monitor.cancel()
             _notify_task.cancel()
+
+            # Close the Slack native task-card stream (if one was opened for
+            # this turn). First drain any still-queued card updates —
+            # task_finished coroutines are scheduled fire-and-forget, so
+            # calling chat.stopStream before they land freezes tasks at
+            # in_progress and Slack renders them with warning icons. Never
+            # raises — SlackTaskStream.stop() swallows its own errors so a
+            # failed chat.stopStream can't break delivery.
+            if _slack_task_stream is not None:
+                try:
+                    # NOTE: await via wrap_future — these futures resolve ON
+                    # this same event loop, so a blocking .result() here
+                    # would deadlock the loop against its own queue.
+                    for _fut in _slack_task_futures:
+                        try:
+                            await asyncio.wait_for(asyncio.wrap_future(_fut), timeout=5)
+                        except Exception:
+                            pass
+                    await _slack_task_stream.stop()
+                except Exception:
+                    logger.debug("SlackTaskStream.stop() failed", exc_info=True)
 
             # Wait for stream consumer to finish its final edit
             if stream_task:
