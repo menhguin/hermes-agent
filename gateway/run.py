@@ -16912,11 +16912,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _result = kwargs.get("result")
                 # Short result preview for the expanded card body — unwrap
                 # the JSON envelope + collapse whitespace so it reads as a
-                # glanceable summary, not a raw {"output": "..."} dump.
+                # glanceable summary. Kept SHORT (Minh 2026-07-05: tool
+                # previews are mostly clutter; the reasoning cards are the
+                # signal) — also buys message-size budget for reasoning.
                 try:
-                    output = _sts.clean_output_preview(_result, limit=300)
+                    output = _sts.clean_output_preview(_result, limit=120)
                 except Exception:
-                    output = _result.strip()[:300] if isinstance(_result, str) and _result.strip() else None
+                    output = _result.strip()[:120] if isinstance(_result, str) and _result.strip() else None
                 # MCP tools report failures as result TEXT with is_error
                 # False — sniff those so a 403 doesn't render with a ✓.
                 if ok and _sts.result_looks_like_error(_result):
@@ -16978,10 +16980,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _fut is not None:
                 _slack_task_futures.append(_fut)
 
-        # Reasoning → card header: throttle raw reasoning deltas into a
-        # rolling "💭 <latest thought>" plan_update. Deltas arrive token-by-
-        # token and plan_update replaces the header wholesale, so we buffer
-        # and flush at most once per interval, showing the tail line.
+        # Reasoning → 💭 cards: batch raw reasoning deltas and flush the FULL
+        # unsent text to the stream at most once per interval. The module
+        # accumulates flushes into the card body (details) and shows the
+        # rolling tail in the title — full reasoning is signal, so nothing
+        # is dropped here beyond the module's own tail-keep cap.
         _slack_reasoning_buf = [""]
         _slack_reasoning_last = [0.0]
         _SLACK_REASONING_INTERVAL_S = 2.0
@@ -16992,20 +16995,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             if not isinstance(text, str) or not text:
                 return
-            _slack_reasoning_buf[0] = (_slack_reasoning_buf[0] + text)[-600:]
+            _slack_reasoning_buf[0] += text
             now = time.monotonic()
             if now - _slack_reasoning_last[0] < _SLACK_REASONING_INTERVAL_S:
                 return
             _slack_reasoning_last[0] = now
-            # Render the last sentence-ish fragment of the buffer.
-            tail = _slack_reasoning_buf[0].replace("\n", " ").strip()
-            for sep in (". ", "! ", "? "):
-                if sep in tail:
-                    tail = tail.rsplit(sep, 1)[-1]
-            if not tail:
+            pending, _slack_reasoning_buf[0] = _slack_reasoning_buf[0], ""
+            pending = pending.strip()
+            if not pending:
                 return
             _fut = safe_schedule_threadsafe(
-                _slack_task_stream.reasoning_update(tail),
+                _slack_task_stream.reasoning_update(pending),
                 _voice_ack_loop,
                 logger=logger,
                 log_message="slack reasoning_update scheduling error",

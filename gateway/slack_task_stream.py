@@ -80,6 +80,21 @@ def tool_label(tool_name: str) -> str:
     return meta[0] if meta else tool_name
 
 
+def _word_trim(text: str, limit: int) -> str:
+    """Trim to ``limit`` chars at a word boundary, appending an ellipsis.
+
+    Slicing raw delta buffers mid-word rendered titles like "run.py first.I've"
+    — trim back to the last space when one exists reasonably close to the cap.
+    """
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    sp = cut.rfind(" ")
+    if sp > limit * 0.6:
+        cut = cut[:sp]
+    return cut.rstrip() + "…"
+
+
 def clean_output_preview(result: Any, limit: int = 300) -> Optional[str]:
     """Turn a raw tool result into a compact, human-readable card preview.
 
@@ -113,9 +128,7 @@ def clean_output_preview(result: Any, limit: int = 300) -> Optional[str]:
     text = " ".join(text.split())
     if not text:
         return None
-    if len(text) > limit:
-        text = text[: limit - 1].rstrip() + "…"
-    return text
+    return _word_trim(text, limit)
 
 
 def summarize_tool_title(tool_name: str, args: Any, result: Any) -> Optional[str]:
@@ -167,7 +180,7 @@ def tool_details_from_args(tool_name: str, args: Any) -> Optional[str]:
     val = args.get(key)
     if not isinstance(val, str) or not val.strip():
         return None
-    return val.strip()[:500]
+    return val.strip()[:300]
 
 
 # Tools whose results naturally carry URL attributions worth surfacing as
@@ -244,11 +257,31 @@ class SlackTaskStream:
     push ``task_update`` chunks keyed by a stable per-tool-call id, and
     ``stop()`` closes the stream when the turn completes.
 
-    All public methods swallow their own errors (log at debug) and flip
-    ``self.disabled`` on failure so the caller can fall back to the markdown
-    progress path for the rest of the turn instead of retrying a broken
-    stream on every subsequent event.
+    Long turns outlive a single streamed message — Slack closes streams
+    after ~5 minutes (``message_not_in_streaming_state``) and caps the
+    cumulative message size (``msg_too_long``). Rather than falling back to
+    markdown, the stream ROLLS OVER: the current card is closed cleanly and
+    a fresh streaming message continues the timeline, replaying any
+    still-in-progress tasks so their completion lands on the new card.
+    Rollover happens proactively (age/size thresholds, so the user never
+    sees an error) and reactively (on either recoverable API error).
+
+    All public methods swallow their own errors (log at info) and flip
+    ``self.disabled`` on unrecoverable failure so the caller can fall back
+    to the markdown progress path for the rest of the turn instead of
+    retrying a broken stream on every subsequent event.
     """
+
+    # Proactive rollover thresholds: Slack kills streams at ~5 min and
+    # bounces appends once the message's cumulative content is too large
+    # (both observed live 2026-07-05). Roll over comfortably before both.
+    ROLLOVER_MAX_AGE_S = 240.0
+    ROLLOVER_MAX_CHARS = 10_000
+    # Runaway guard: a turn pathological enough to need more fresh streams
+    # than this should fall back to markdown instead. Sized generously —
+    # age-based rollover alone consumes one per ~4 min, so a legitimate
+    # 40-60 min turn can use 10-15 (observed turns run 20+ min).
+    MAX_ROLLOVERS = 20
 
     def __init__(
         self,
@@ -283,13 +316,25 @@ class SlackTaskStream:
         self._details: dict = {}
         # Interleaved reasoning cards: each burst of thinking between tool
         # calls gets its own 💭 card in the timeline (updated in place while
-        # the burst continues, finalized when the next tool starts).
+        # the burst continues, finalized when the next tool starts). The
+        # title carries the rolling tail of the thought; the card's DETAILS
+        # carries the full burst text (titles are capped ~255 by Slack,
+        # details can hold far more — that's where full reasoning lives).
         self._reasoning_open_id: Optional[str] = None
         self._reasoning_title: str = ""
+        self._reasoning_details: str = ""
         self._reasoning_count = 0
         # Per-subagent state (card id → {tools, number, start-time}) for the
         # numbered, timed delegate cards.
         self._subagents: dict = {}
+        # Rollover state: when the current streamed message ages/fills out,
+        # it's closed and a fresh one continues the timeline. Tasks still
+        # in_progress at rollover are tracked so they can be replayed onto
+        # the new card (their task ids don't exist there otherwise).
+        self._stream_opened_at = 0.0
+        self._sent_chars = 0
+        self._rollovers = 0
+        self._in_progress: dict = {}  # task_id → last-sent chunk kwargs
         # Serializes the open: tool events arrive back-to-back and each
         # task_started() awaits ensure_started(), so without a lock two
         # coroutines can both pass the ``_started`` check before either
@@ -317,29 +362,39 @@ class SlackTaskStream:
         if self._started:
             return True
         try:
-            kwargs: dict = {
-                "channel": self.channel,
-                "thread_ts": self.thread_ts,
-                "task_display_mode": self.task_display_mode,
-            }
-            # Slack requires BOTH recipient ids for streams opened by bot
-            # tokens, despite the API docs listing them as optional
-            # (empirically: omitting team → missing_recipient_team_id,
-            # omitting user → missing_recipient_user_id). Pass when known.
-            if self.recipient_team_id:
-                kwargs["recipient_team_id"] = self.recipient_team_id
-            if self.recipient_user_id:
-                kwargs["recipient_user_id"] = self.recipient_user_id
-            result = await self.client.chat_startStream(**kwargs)
-            self.ts = result.get("ts") if result else None
-            if not self.ts:
-                raise RuntimeError("chat.startStream returned no ts")
+            await self._open_stream()
             self._started = True
             return True
         except Exception as e:  # SlackApiError or any transport failure
             logger.info("chat.startStream failed, disabling native task cards: %s", e)
             self.disabled = True
             return False
+
+    async def _open_stream(self) -> None:
+        """Raw chat.startStream call — shared by first open and rollover.
+
+        Raises on failure; callers decide whether that's fatal. Takes no
+        locks (callers already hold whichever lock is appropriate).
+        """
+        kwargs: dict = {
+            "channel": self.channel,
+            "thread_ts": self.thread_ts,
+            "task_display_mode": self.task_display_mode,
+        }
+        # Slack requires BOTH recipient ids for streams opened by bot
+        # tokens, despite the API docs listing them as optional
+        # (empirically: omitting team → missing_recipient_team_id,
+        # omitting user → missing_recipient_user_id). Pass when known.
+        if self.recipient_team_id:
+            kwargs["recipient_team_id"] = self.recipient_team_id
+        if self.recipient_user_id:
+            kwargs["recipient_user_id"] = self.recipient_user_id
+        result = await self.client.chat_startStream(**kwargs)
+        self.ts = result.get("ts") if result else None
+        if not self.ts:
+            raise RuntimeError("chat.startStream returned no ts")
+        self._stream_opened_at = time.monotonic()
+        self._sent_chars = 0
 
     async def task_started(
         self,
@@ -425,7 +480,7 @@ class SlackTaskStream:
         if not ok:
             title = f"{base} · ✗ failed"[:250]
         self._total_duration += duration or 0.0
-        out = str(output)[:400] if output else None
+        out = str(output)[:150] if output else None
         # Re-send the start-time details so the collapsible content preview
         # (file body for Write/Edit, code for Run) survives the finish
         # update instead of being wiped by the card replacement.
@@ -507,6 +562,13 @@ class SlackTaskStream:
         — an earlier version routed reasoning through the header, which
         wiped it (plan_update replaces the title wholesale).
 
+        Layout (per Minh 2026-07-05: full reasoning matters most — tool
+        previews are clutter, reasoning is signal): the TITLE shows the
+        rolling tail of the current thought at word-boundary (titles are
+        Slack-capped ~255); the collapsible DETAILS carries the full burst
+        text (tail-kept up to ~1500 chars), so expanding the 💭 card reads
+        the whole thought, not a fragment.
+
         Before the stream opens (thinking that precedes the first tool call
         — i.e. every turn's opening thought), the burst is BUFFERED rather
         than dropped: state is updated but no API call is made, and the
@@ -519,25 +581,45 @@ class SlackTaskStream:
         line = " ".join(str(text).split())
         if not line:
             return
-        if len(line) > 180:
-            line = line[:177] + "…"
         if self._reasoning_open_id is None:
             self._reasoning_count += 1
             self._reasoning_open_id = f"think{self._reasoning_count}"
-        self._reasoning_title = f"💭 {line}"[:250]
+            self._reasoning_details = ""
+        # Details accumulate the full burst; keep the tail if it overflows
+        # (the freshest thinking is the part worth reading).
+        self._reasoning_details = (self._reasoning_details + " " + line).strip()
+        if len(self._reasoning_details) > 1500:
+            clipped = self._reasoning_details[-1500:]
+            # Cut at the first word boundary inside the clip window.
+            sp = clipped.find(" ")
+            self._reasoning_details = "…" + clipped[sp + 1 if 0 <= sp < 40 else 0:]
+        # Title = the tail of the accumulated burst (not the raw delta,
+        # which can start mid-sentence), trimmed at a word boundary.
+        tail = self._reasoning_details[-245:]
+        if len(self._reasoning_details) > 245:
+            sp = tail.find(" ")
+            if 0 <= sp < 40:
+                tail = "…" + tail[sp + 1:]
+        self._reasoning_title = f"💭 {tail}"[:250]
         if not self._started:
             return  # buffered — flushed by the first task_started
         await self._append_raw_task(
-            self._reasoning_open_id, self._reasoning_title, status="in_progress",
+            self._reasoning_open_id, self._reasoning_title,
+            status="in_progress", details=self._reasoning_details,
         )
 
     async def _finalize_reasoning_card(self) -> None:
         """Mark the open 💭 card complete (called when the next tool starts)."""
         if self._reasoning_open_id is None:
             return
-        rid, title = self._reasoning_open_id, self._reasoning_title
+        rid, title, details = (
+            self._reasoning_open_id, self._reasoning_title, self._reasoning_details,
+        )
         self._reasoning_open_id = None
-        await self._append_raw_task(rid, title, status="complete")
+        self._reasoning_details = ""
+        await self._append_raw_task(
+            rid, title, status="complete", details=details or None,
+        )
 
     async def set_plan_title(self, title: str) -> None:
         """Set/update the card's collapsible header via a plan_update chunk.
@@ -597,17 +679,84 @@ class SlackTaskStream:
                 chunk["output"] = output
             if sources:
                 chunk["sources"] = sources
+            # Track open tasks for rollover replay: an in_progress card must
+            # be re-created on the fresh stream or its completion update
+            # would reference a task id that doesn't exist there.
+            if status == "in_progress":
+                self._in_progress[task_id] = dict(chunk)
+            else:
+                self._in_progress.pop(task_id, None)
             async with self._send_lock:
                 if self.disabled:
                     return
-                await self.client.chat_appendStream(
-                    channel=self.channel,
-                    ts=self.ts,
-                    chunks=[chunk],
-                )
+                # Proactive rollover: refresh the stream *before* Slack's
+                # ~5-min stream lifetime or per-message size cap kill it,
+                # so the user never sees an error state.
+                if (
+                    time.monotonic() - self._stream_opened_at > self.ROLLOVER_MAX_AGE_S
+                    or self._sent_chars > self.ROLLOVER_MAX_CHARS
+                ):
+                    await self._rollover_locked()
+                try:
+                    await self._send_chunk_locked(chunk)
+                except Exception as e:
+                    # Reactive rollover: both errors mean "this message can't
+                    # take more content" — recoverable with a fresh stream.
+                    if any(m in str(e) for m in ("message_not_in_streaming_state", "msg_too_long")):
+                        await self._rollover_locked()
+                        await self._send_chunk_locked(chunk)
+                    else:
+                        raise
         except Exception as e:
             logger.info("chat.appendStream failed, disabling native task cards: %s", e)
             self.disabled = True
+
+    async def _send_chunk_locked(self, chunk: dict) -> None:
+        """Send one chunk on the current stream. Caller holds _send_lock."""
+        await self.client.chat_appendStream(
+            channel=self.channel,
+            ts=self.ts,
+            chunks=[chunk],
+        )
+        # Approximate the message-size budget by summing sent content.
+        self._sent_chars += sum(len(str(v)) for v in chunk.values())
+
+    async def _rollover_locked(self) -> None:
+        """Close the current stream and continue on a fresh one.
+
+        Caller holds _send_lock. Raises if the fresh stream can't be opened
+        (caller's outer except then disables cards — correct: no stream to
+        write to). The old card is stopped best-effort with a continuation
+        footer; still-open tasks and the turn header are replayed onto the
+        new card so the timeline visually continues.
+        """
+        self._rollovers += 1
+        if self._rollovers > self.MAX_ROLLOVERS:
+            raise RuntimeError(f"exceeded {self.MAX_ROLLOVERS} stream rollovers this turn")
+        try:
+            await self.client.chat_stopStream(
+                channel=self.channel,
+                ts=self.ts,
+                blocks=[{
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": "⤵ continued below"}],
+                }],
+            )
+        except Exception as e:
+            # Old stream may already be dead (that's why we're here).
+            logger.info("rollover: closing old stream failed (non-fatal): %s", e)
+        await self._open_stream()
+        logger.info(
+            "rollover: continued task cards on fresh stream ts=%s (rollover #%d)",
+            self.ts, self._rollovers,
+        )
+        # Replay the turn header and any in-flight tasks on the new card.
+        replay: List[dict] = []
+        if self._last_header:
+            replay.append({"type": "plan_update", "title": self._last_header[:250]})
+        replay.extend(dict(c) for c in self._in_progress.values())
+        for chunk in replay:
+            await self._send_chunk_locked(chunk)
 
     async def stop(self, final_text: Optional[str] = None) -> None:
         """Close the streaming message. No-op if never started or already stopped."""
