@@ -1391,6 +1391,26 @@ class DiscordAdapter(BasePlatformAdapter):
             async def on_ready():
                 logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
 
+                # Set presence/activity ("Playing <X>") if DISCORD_ACTIVITY is set.
+                # Official discord.py path: change_presence in on_ready so it
+                # re-applies after every reconnect/RESUME, not just first boot.
+                _act = (os.getenv("DISCORD_ACTIVITY", "") or "").strip()
+                if _act:
+                    try:
+                        _atype = (os.getenv("DISCORD_ACTIVITY_TYPE", "playing") or "playing").strip().lower()
+                        if _atype == "watching":
+                            _activity = discord.Activity(type=discord.ActivityType.watching, name=_act)
+                        elif _atype == "listening":
+                            _activity = discord.Activity(type=discord.ActivityType.listening, name=_act)
+                        elif _atype == "custom":
+                            _activity = discord.CustomActivity(name=_act)
+                        else:
+                            _activity = discord.Game(name=_act)
+                        await adapter_self._client.change_presence(activity=_activity)
+                        logger.info("[%s] Presence set: %s '%s'", adapter_self.name, _atype, _act)
+                    except Exception:
+                        logger.debug("[%s] Failed to set Discord presence", adapter_self.name, exc_info=True)
+
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
                 adapter_self._ready_event.set()
