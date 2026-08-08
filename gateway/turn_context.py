@@ -65,6 +65,15 @@ class TurnContext:
     _progress_metadata: Optional[dict] = None
     _progress_reply_to: Optional[Any] = None
 
+    # --- Slack native task cards (opt-in; assigned post-construction in
+    #     _run_agent_inner when display.platforms.slack.tool_progress_native
+    #     resolves on) -----------------------------------------------------
+    _slack_native_cards: bool = False
+    _slack_task_stream: Any = None
+    _slack_task_event: Any = None
+    _slack_subagent_event: Any = None
+    _slack_reasoning_event: Any = None
+
     # ------------------------------------------------------------------
     # run_sync extraction (second wave of the seam): the closed-over locals
     # of ``_run_agent_inner`` that ``run_sync`` (and the four sibling bridge
