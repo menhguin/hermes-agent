@@ -1182,6 +1182,22 @@ class HonchoSessionManager:
             )
             return False
 
+        # [CUSTOM 2026-08-09 — task #00000801] Only migrate the owner-describing
+        # memory files (MEMORY.md / USER.md) into sessions whose user peer IS the
+        # configured owner. Upstream uploads them under the session's *runtime*
+        # user peer — so in any shared channel, a non-owner's first message in a
+        # new thread uploads the owner's full USER.md under the NON-OWNER's peer,
+        # and Honcho's deriver attributes the owner's entire profile (incl.
+        # psychometrics/medical) to that person. See architecture/honcho.md
+        # "prior_memory_file migration poisoning". SOUL.md is unaffected
+        # (uploaded under the assistant peer, which is always ours).
+        if session.user_peer_id != self._sanitize_id(self._config.peer_name):
+            logger.info(
+                "Skipping memory-file migration for non-owner session (user=%s)",
+                session.user_peer_id,
+            )
+            return False
+
         uploaded = False
         files = [
             (
