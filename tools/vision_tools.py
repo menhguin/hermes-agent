@@ -1645,6 +1645,19 @@ def check_vision_requirements() -> bool:
     tool list whenever the explicit provider name was unresolvable, even
     when the auto chain would have served the request (issue #31179).
     """
+    # [CARNIE PATCH 2026-07-27 — dogfood, cf. upstream #24681 comment]
+    # The native fast path needs NO auxiliary client: it returns the image
+    # bytes straight to the main model as a multimodal tool-result envelope.
+    # Gating tool EXISTENCE on aux-client resolvability is therefore wrong
+    # whenever the fast path is active — e.g. main provider kimi-coding (in
+    # _PROVIDERS_WITHOUT_VISION per #17076) with no aggregator creds made the
+    # tool silently vanish even though the main model (K3, multimodal) could
+    # have taken pixels directly. Short-circuit before the aux resolution.
+    try:
+        if _should_use_native_vision_fast_path():
+            return True
+    except Exception:
+        pass
     try:
         from agent.auxiliary_client import aux_probe_mode, resolve_vision_provider_client
     except ImportError:
