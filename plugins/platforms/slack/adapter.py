@@ -2270,6 +2270,13 @@ class SlackAdapter(BasePlatformAdapter):
             async def handle_assistant_thread_context_changed(event, say, body):
                 await self._handle_assistant_thread_lifecycle_event(event, body)
 
+            # Agent Sessions stop button: Slack fires agent_session_stopped
+            # when the user clicks stop in the Agent view. Route it into the
+            # message pipeline as a synthetic /stop command.
+            @self._app.event("agent_session_stopped")
+            async def handle_agent_session_stopped(event, say, body):
+                await self._handle_agent_session_stopped(event, body)
+
             # Catch-all no-op ack for any other subscribed event type that
             # Hermes has no listener for (e.g. user_change,
             # user_huddle_changed, member_joined_channel, channel_archive,
@@ -5532,6 +5539,61 @@ class SlackAdapter(BasePlatformAdapter):
         )
 
 
+    async def _handle_agent_session_stopped(
+        self, event: dict, body: Optional[dict] = None
+    ) -> None:
+        """Handle the Agent Sessions stop button.
+
+        Slack fires ``agent_session_stopped`` when the user clicks stop in
+        the Agent view. Inject a synthetic ``/stop`` message into the normal
+        pipeline so the gateway's existing ``_handle_stop_command`` aborts
+        the active turn, then best-effort transition the session out of
+        "processing" (Slack does not auto-update the session status).
+        """
+        channel_id = event.get("channel") or event.get("channel_id") or ""
+        if not channel_id:
+            logger.debug(
+                "[Slack] agent_session_stopped without channel; ignoring: %s",
+                event,
+            )
+            return
+        user_id = event.get("user") or event.get("user_id") or ""
+        thread_ts = event.get("thread_ts") or ""
+        team_id = self._event_team_id(event, body)
+
+        # Field names mirror the other synthetic-message injections in this
+        # adapter (reaction trigger and file_share fallback paths).
+        synthetic: dict = {
+            "type": "message",
+            "user": user_id,
+            "text": "/stop",
+            "channel": channel_id,
+            "ts": event.get("ts") or event.get("event_ts") or "",
+            # The stop button is definitionally addressed to the bot — skip
+            # the mention requirement. User authorization still applies.
+            "_hermes_force_process": True,
+        }
+        if thread_ts:
+            synthetic["thread_ts"] = thread_ts
+        if team_id:
+            synthetic["team"] = team_id
+        await self._handle_slack_message(synthetic)
+
+        # Slack requires the app to move the session out of "processing"
+        # itself after a stop; status="" maps to "active" via the helper
+        # (and clears the status on the legacy fallback lane).
+        if thread_ts:
+            try:
+                await self._agent_sessions_set_status(
+                    self._get_client(channel_id, team_id=team_id),
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                    status="",
+                )
+            except Exception as e:
+                logger.debug(
+                    "[Slack] post-stop agent session status reset failed: %s", e
+                )
     async def _handle_app_context_changed(
         self, event: dict, body: Optional[dict] = None
     ) -> None:
