@@ -3666,7 +3666,8 @@ class SlackAdapter(BasePlatformAdapter):
                     _status = f"still working… ({_human})"
                 else:
                     _status = "is thinking..."
-            await self._get_client(chat_id, team_id=team_id).assistant_threads_setStatus(
+            await self._agent_sessions_set_status(
+                self._get_client(chat_id, team_id=team_id),
                 channel_id=chat_id,
                 thread_ts=thread_ts,
                 status=_status,
@@ -3747,13 +3748,87 @@ class SlackAdapter(BasePlatformAdapter):
         if not thread_ts:
             return
         try:
-            await self._get_client(chat_id, team_id=team_id).assistant_threads_setStatus(
+            await self._agent_sessions_set_status(
+                self._get_client(chat_id, team_id=team_id),
                 channel_id=chat_id,
                 thread_ts=thread_ts,
                 status="",
             )
         except Exception as e:
             logger.debug("[Slack] assistant.threads.setStatus clear failed: %s", e)
+
+    async def _agent_sessions_set_status(
+        self, client, channel_id: str, thread_ts: str, status: str
+    ) -> None:
+        """Set assistant-thread status via the Agent Sessions API, falling
+        back to the legacy ``assistant.threads.setStatus`` on any error.
+
+        Semantic change: ``agents.sessions.setStatus`` takes an ENUM status
+        (``active`` | ``processing`` | ``suspended`` | ``closed``), not the
+        free-text status the old API accepted. Free-text statuses
+        ("is thinking...", "still working…") map to ``processing``; a clear
+        (``status=""``) maps to ``active``. The fallback passes the original
+        free-text status through unchanged.
+
+        Raises whatever the fallback call raises so the caller's existing
+        outer try/except (debug log) still applies.
+        """
+        try:
+            await client.api_call(
+                "agents.sessions.setStatus",
+                json={
+                    "channel_id": channel_id,
+                    "thread_ts": thread_ts,
+                    "status": "processing" if status else "active",
+                },
+            )
+            if getattr(self, "_agent_sessions_lane", None) is not True:
+                self._agent_sessions_lane = True
+                logger.info("[Slack] Agent Sessions API active (agents.sessions.*)")
+        except Exception as e:
+            if getattr(self, "_agent_sessions_lane", None) is not False:
+                self._agent_sessions_lane = False
+                logger.info(
+                    "[Slack] agents.sessions.* unavailable, using "
+                    "assistant.threads.* fallback: %s",
+                    e,
+                )
+            await client.assistant_threads_setStatus(
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                status=status,
+            )
+
+    async def _agent_sessions_rename(
+        self, client, channel_id: str, thread_ts: str, title: str
+    ) -> None:
+        """Rename an assistant thread via ``agents.sessions.rename``, falling
+        back to the legacy ``assistant.threads.setTitle`` on any error."""
+        try:
+            await client.api_call(
+                "agents.sessions.rename",
+                json={
+                    "channel_id": channel_id,
+                    "thread_ts": thread_ts,
+                    "title": title,
+                },
+            )
+            if getattr(self, "_agent_sessions_lane", None) is not True:
+                self._agent_sessions_lane = True
+                logger.info("[Slack] Agent Sessions API active (agents.sessions.*)")
+        except Exception as e:
+            if getattr(self, "_agent_sessions_lane", None) is not False:
+                self._agent_sessions_lane = False
+                logger.info(
+                    "[Slack] agents.sessions.* unavailable, using "
+                    "assistant.threads.* fallback: %s",
+                    e,
+                )
+            await client.assistant_threads_setTitle(
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                title=title,
+            )
 
     def _dm_top_level_threads_as_sessions(self) -> bool:
         """Whether top-level Slack DMs get per-message session threads.
@@ -5350,7 +5425,8 @@ class SlackAdapter(BasePlatformAdapter):
             title = title[:77].rstrip() + "..."
 
         try:
-            await self._get_client(channel_id, team_id=team_id).assistant_threads_setTitle(
+            await self._agent_sessions_rename(
+                self._get_client(channel_id, team_id=team_id),
                 channel_id=channel_id,
                 thread_ts=thread_ts,
                 title=title,
@@ -5454,6 +5530,7 @@ class SlackAdapter(BasePlatformAdapter):
             team_id=metadata.get("team_id", ""),
             thread_ts=metadata.get("thread_ts", ""),
         )
+
 
     async def _handle_app_context_changed(
         self, event: dict, body: Optional[dict] = None
