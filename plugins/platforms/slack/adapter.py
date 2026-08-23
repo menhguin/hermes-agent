@@ -3544,6 +3544,12 @@ class SlackAdapter(BasePlatformAdapter):
         # commentary) pass through. An empty ``sent`` prefix would match
         # everything, so require substance before claiming the send.
         if not sent or not text.startswith(sent):
+            # Prefix miss: the final content does not extend the open stream.
+            # Seal + pop the dangling stream so send()'s normal postMessage is
+            # the only copy (previously the stream was left open AND the final
+            # was posted -> duplicate message). Mirrors the append path.
+            await self._seal_stream(chat_id, stream)
+            self._active_streams.pop(chat_id, None)
             return None
         self._active_streams.pop(chat_id, None)
         ts = stream["ts"]
