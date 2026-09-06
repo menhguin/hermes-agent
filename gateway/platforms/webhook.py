@@ -1131,9 +1131,12 @@ class WebhookAdapter(BasePlatformAdapter):
         # Pocket's documented scheme (docs.heypocketai.com/docs/api/webhooks);
         # ms-resolution timestamp, 300s replay window (same as generic V2).
         hp_sig = request.headers.get("X-HeyPocket-Signature", "")
-        if hp_sig:
+        if (
+            "X-HeyPocket-Signature" in request.headers
+            or "X-HeyPocket-Timestamp" in request.headers
+        ):
             hp_timestamp = request.headers.get("X-HeyPocket-Timestamp", "")
-            if not hp_timestamp:
+            if not hp_sig or not hp_timestamp:
                 return False
             try:
                 hp_ts = int(hp_timestamp)
