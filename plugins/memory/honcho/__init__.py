@@ -49,9 +49,17 @@ _INTERNAL_GATEWAY_TURN_RE = re.compile(
 )
 
 
+# Shared Slack sessions prefix even internal events with the routing user's
+# identity. Strip only this known transport envelope, not arbitrary brackets.
+_SLACK_SENDER_PREFIX_RE = re.compile(
+    r"^\s*\[[^\[\]\r\n]+ \| Slack user <@[UW][A-Z0-9]+>\][ \t]+"
+)
+
+
 def _is_internal_gateway_turn(text: str) -> bool:
     """Return True for machine-generated gateway/delegation notifications."""
-    return bool(_INTERNAL_GATEWAY_TURN_RE.match(text or ""))
+    text = _SLACK_SENDER_PREFIX_RE.sub("", text or "", count=1)
+    return bool(_INTERNAL_GATEWAY_TURN_RE.match(text))
 
 
 # ---------------------------------------------------------------------------
@@ -1404,7 +1412,10 @@ class HonchoMemoryProvider(MemoryProvider):
             ),
         }
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(
+        self, user_content: str, assistant_content: str, *, session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
         """Record the conversation turn in Honcho (non-blocking).
 
         Messages exceeding the Honcho API limit (default 25k chars) are
@@ -1419,6 +1430,17 @@ class HonchoMemoryProvider(MemoryProvider):
         # was parsed into HonchoClientConfig but never enforced here, so a
         # cached hybrid provider kept writing even after containment was set.
         if self._config and not getattr(self._config, "save_messages", True):
+            return
+        # MemoryManager already offers the live transcript to providers that
+        # accept it. Use the gateway's native origin marker before falling
+        # back to text for callers/legacy turns without typed metadata. Only
+        # the current user turn counts; older notifications must not suppress
+        # later genuine conversation.
+        current_user = next(
+            (msg for msg in reversed(messages or []) if msg.get("role") == "user"),
+            {},
+        )
+        if current_user.get("display_kind") == "internal_notification":
             return
         if _is_internal_gateway_turn(user_content):
             logger.debug("Honcho sync skipped machine-generated gateway turn")
