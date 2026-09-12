@@ -322,6 +322,10 @@ class StreamDeliveryMixin:
             # content deltas.
             self._note_dropped_stream_writer("_fire_reasoning_delta")
             return
+        # Only callback attempts latch, never plugin-only or fenced-out deltas.
+        # Set before invoking: a display may accept text and then raise (#59009).
+        if text and self.reasoning_callback is not None:
+            self._reasoning_streamed_this_response = True
         self._call_quietly(self.reasoning_callback, text)
         try:
             from agent.plugin_stream_hooks import stream_reasoning_deltas_enabled

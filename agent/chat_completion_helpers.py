@@ -38,7 +38,7 @@ from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import (_sanitize_surrogates, _repair_tool_call_arguments)
-from agent.reasoning_summaries import separate_glued_reasoning_blocks
+from agent.reasoning_summaries import ReasoningDeltaAccumulator
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool_lifecycle import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
@@ -1148,6 +1148,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
     per-request client (interrupts close only that one); a stale-call detector
     kills the connection and raises so the main retry loop can back off / rotate
     credentials / fall back."""
+    # Response-scoped callback latch (#59009); reset before EVERY dispatch,
+    # including inline calls and recovery after an unmaterialized/aborted response.
+    agent._reasoning_streamed_this_response = False
     # Nested-pool contexts (cron, delegated children) wedge on a worker thread
     # (#62151): run inline. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
@@ -1421,11 +1424,15 @@ def _assistant_reasoning_text(agent, assistant_message) -> Optional[str]:
             reasoning_text = "\n\n".join(b.strip() for b in think_blocks if b.strip()) or None
     if reasoning_text and agent.verbose_logging:
         logging.debug(f"Captured reasoning ({len(reasoning_text)} chars): {reasoning_text}")
-    # When streaming is active the reasoning was already displayed during the
-    # stream (structured deltas or <think> tag extraction); fire only for
-    # non-streaming modes (gateway, batch, quiet). Anything not shown during
-    # streaming is caught by the CLI post-response fallback.
-    if reasoning_text and agent.reasoning_callback and not agent.stream_delta_callback and not agent._stream_callback:
+    # A reasoning-only consumer can receive deltas without a text stream (#59009).
+    # Keep the text-consumer guard too: CLI <think> extraction bypasses the sink.
+    # Retain the latch until API entry, not just this materialization, so repeated
+    # storage/final-response builds cannot replay the callback. Latch before an
+    # attempt: a callback may accept text and then raise (replaying is unsafe).
+    if (reasoning_text and agent.reasoning_callback
+            and not getattr(agent, "_reasoning_streamed_this_response", False)
+            and not agent.stream_delta_callback and not agent._stream_callback):
+        agent._reasoning_streamed_this_response = True
         with contextlib.suppress(Exception):
             agent.reasoning_callback(reasoning_text)
     return _sanitize_surrogates(reasoning_text) if reasoning_text else reasoning_text
@@ -2750,7 +2757,8 @@ class _StreamingCall(StreamingWaitMonitor):
         import httpx as _httpx
         base_timeout, read_timeout, conn_cap = self._stream_timeouts()
         content_parts: list = []
-        reasoning_parts: list = []
+        reasoning = ReasoningDeltaAccumulator()
+        reasoning_parts = reasoning.parts
         pending_text_parts: list[str] = []
         tool_calls = _ToolCallAccumulator()
         tool_calls_acc = tool_calls.acc
@@ -2820,11 +2828,9 @@ class _StreamingCall(StreamingWaitMonitor):
 
             reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             if reasoning_text:
-                # Summary-part models omit the separator between markdown blocks; re-insert it.
-                reasoning_text = separate_glued_reasoning_blocks(
-                    reasoning_parts[-1] if reasoning_parts else "", reasoning_text)
-                reasoning_parts.append(reasoning_text)
-                self._emit_reasoning(reasoning_text)
+                reasoning_text = reasoning.feed(reasoning_text)
+                if reasoning_text:
+                    self._emit_reasoning(reasoning_text)
 
             # Text (list-of-blocks deltas flattened once); possible echoed SSE is
             # buffered until it can be judged.
@@ -3352,6 +3358,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     text token (tool-call turns suppress them) and returns a SimpleNamespace in
     the non-streaming response shape. codex_responses delegates to the already-
     streaming codex runner; cron turns and delegated children run inline."""
+    # Reset before early exits and Codex/Bedrock passthrough, not inside one wire.
+    agent._reasoning_streamed_this_response = False
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
     if agent.api_mode == "codex_responses":

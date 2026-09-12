@@ -1215,18 +1215,22 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
     (OpenRouter unified), else inline thinking blocks in the content; None when absent."""
     parts: List[str] = []
 
-    def _add(text) -> None:
+    def _add(text, *, detail: bool = False) -> None:
         from agent.message_content import flatten_message_text
 
         text = flatten_message_text(text, sep="")
-        if text and text not in parts:
+        # Providers repeat the accumulated reasoning as smaller detail blocks
+        # (#59009). Keep typed flattening and exact dedup for independent fields.
+        duplicate = any(text in part for part in parts) if detail else text in parts
+        if text and not duplicate:
             parts.append(text)
     _add(getattr(assistant_message, "reasoning", None))
     _add(getattr(assistant_message, "reasoning_content", None))
     # reasoning_details: [{"type": "reasoning.summary", "summary": "...", ...}, ...]
     for detail in getattr(assistant_message, "reasoning_details", None) or []:
         if isinstance(detail, dict):
-            _add(detail.get('summary') or detail.get('thinking') or detail.get('content') or detail.get('text'))
+            _add(detail.get('summary') or detail.get('thinking') or detail.get('content') or detail.get('text'),
+                 detail=True)
     # Fall back to reasoning embedded in content only when no structured field was found.
     content = getattr(assistant_message, "content", None)
     if not parts and isinstance(content, list):
