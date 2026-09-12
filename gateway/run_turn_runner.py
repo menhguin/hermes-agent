@@ -101,6 +101,11 @@ class TurnRunner:
         # gate: platforms with tool_progress off must still hear about a dead delegation.
         if event_type == "subagent.complete":
             self._progress_subagent_notice(preview, kwargs)
+        if ctx._rich_slack_task_cards and event_type in {"subagent.start", "subagent.tool", "subagent.complete"}:
+            if self._native_card_gate():
+                ctx.progress_queue.put({**kwargs, "type": event_type, "tool_name": tool_name, "preview": preview, "args": args})
+            return
+        if event_type == "subagent.complete":
             return
         self._progress_live_status(event_type, tool_name, args)
         # "log" mode: append tool.started lines to the log queue, silent in chat. Handled before
@@ -304,6 +309,8 @@ class TurnRunner:
         # rather than set dynamically so the state is visible where it lives.
         egress_declined: bool = False
         anonymous_seq: int = 0
+        rich: Any = None
+        pending: list = dataclasses.field(default_factory=list)
 
         @staticmethod
         def _compact(value: Any, limit: int = 120) -> str:
@@ -326,6 +333,13 @@ class TurnRunner:
 
         def apply_event(self, raw: Any) -> bool:
             event_type = raw.get("type") if isinstance(raw, dict) else None
+            if self.rich is not None and event_type in {
+                "tool.started", "tool.completed", "reasoning.delta",
+                "subagent.start", "subagent.tool", "subagent.complete",
+            }:
+                self.pending.append(raw)
+                if event_type not in {"tool.started", "tool.completed"}:
+                    return True
             if event_type not in {"tool.started", "tool.completed"}:
                 return False
             call_id = str(raw.get("tool_call_id") or "")
@@ -374,17 +388,21 @@ class TurnRunner:
 
     async def _task_card_publish(self, st) -> None:
         ctx = self._ctx
-        if not st.tasks:
+        pending, st.pending = getattr(st, "pending", []), []
+        if not st.tasks and not pending:
             return
         if getattr(st, "egress_declined", False):
             # The connector refused this destination earlier in the turn; every
             # later publication would re-deliver the same task text there.
             return
         if not st.native_failed:
-            result = await st.adapter.send_native_task_card_progress(
-                chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title="Hermes is working",
-                reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata, fallback_text=st.fallback_text(),
-            )
+            if getattr(st, "rich", None) is not None:
+                result = await st.rich.publish(pending)
+            else:
+                result = await st.adapter.send_native_task_card_progress(
+                    chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title="Hermes is working",
+                    reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata, fallback_text=st.fallback_text(),
+                )
             if getattr(result, "success", False):
                 return
             # P5(b): an AUTHORIZATION decline is not a broken card lane. The
@@ -434,6 +452,14 @@ class TurnRunner:
         """
         ctx = self._ctx
         st = self._TaskCardState(adapter)
+        if ctx._rich_slack_task_cards:
+            from gateway.slack_task_stream import RichTaskCardSession
+            try:
+                candidate = RichTaskCardSession(adapter, ctx)
+                # Non-direct connectors retain THEIR egress guard and basic cards.
+                st.rich = candidate if candidate.main is not None else None
+            except Exception:
+                logger.warning("Rich card setup failed; using the adapter's native rail", exc_info=True)
         try:
             while ctx._run_still_current():
                 try:
@@ -447,7 +473,12 @@ class TurnRunner:
             if self._task_card_drain(st) and ctx._run_still_current() and not self._agent_interrupted():
                 await self._task_card_publish(st)
         finally:
-            if hasattr(adapter, "stop_native_task_card_progress"):
+            ctx._task_cards_closed = True
+            if st.rich is not None:
+                await st.rich.stop(flush_reasoning=(
+                    ctx._run_still_current() and not self._agent_interrupted() and not st.native_failed
+                ))
+            elif hasattr(adapter, "stop_native_task_card_progress"):
                 # Best-effort on the turn-cleanup path: an escaping transport exception would skip
                 # final-delivery logic (cleanup awaits catch only CancelledError).
                 try:
@@ -522,9 +553,11 @@ class TurnRunner:
         return groups + ([current] if current else [])
 
     async def _send_progress_text(self, st, text: str):
+        from gateway.run import _interim_metadata
         ctx = self._ctx
         result = await st.adapter.send(
-            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
+            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to,
+            metadata=_interim_metadata(ctx._progress_metadata),
         )
         self._track_progress_result(result)
         return result
@@ -715,12 +748,16 @@ class TurnRunner:
 
     def _native_card_gate(self) -> bool:
         ctx = self._ctx
-        return bool(ctx.progress_queue) and ctx._run_still_current() and not self._agent_interrupted()
+        return bool(ctx.progress_queue) and not ctx._task_cards_closed and ctx._run_still_current() and not self._agent_interrupted()
 
     # ── Slack-native task cards: ID-bearing lifecycle callbacks (#29483) ── These ride
     # agent.tool_start_callback / agent.tool_complete_callback so start/completion events correlate by the
     # REAL tool-call id — the name-correlated text events in progress_callback would duplicate cards and
     # mispair concurrent calls to the same tool.
+    def native_reasoning_callback(self, text):
+        if isinstance(text, str) and text and self._native_card_gate():
+            self._ctx.progress_queue.put({"type": "reasoning.delta", "text": text})
+
     def native_tool_start_callback(self, call_id, tool_name, args):
         """Queue an ID-correlated native progress start from the agent thread."""
         if not self._native_card_gate():
@@ -730,6 +767,7 @@ class TurnRunner:
         self._ctx.progress_queue.put({
             "type": "tool.started", "tool_call_id": str(call_id or ""), "tool_name": name,
             "preview": build_tool_preview(name, args or {}, max_len=64) or "",
+            "args": args, "timestamp": time.monotonic(),
         })
 
     def native_tool_complete_callback(self, call_id, tool_name, args, result):
@@ -741,6 +779,7 @@ class TurnRunner:
         is_error, _ = _detect_tool_failure(name, result)
         self._ctx.progress_queue.put({
             "type": "tool.completed", "tool_call_id": str(call_id or ""), "tool_name": name, "is_error": bool(is_error),
+            "args": args, "result": result, "timestamp": time.monotonic(),
         })
 
     def combined_tool_start_callback(self, call_id, tool_name, args):
@@ -1160,6 +1199,11 @@ class TurnRunner:
             if (ctx._voice_ack_guild[0] is not None or ctx._native_slack_task_cards) else None
         )
         agent.tool_complete_callback = ctx.native_tool_complete_callback if ctx._native_slack_task_cards else None
+        # Per-turn assignment is unconditional: a cached agent must not retain the old
+        # queue/stream callback when the user switches the carried opt-in OFF.
+        agent.reasoning_callback = (
+            self.native_reasoning_callback if getattr(ctx, "_rich_slack_task_cards", False) else None
+        )
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None

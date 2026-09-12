@@ -2686,10 +2686,13 @@ class GatewayTurnMixin:
         # native plan/task cards via chat.startStream — the progress queue is needed even though Slack keeps
         # ordinary text tool_progress off by default (requiring both flags would silently leave the native
         # feature inactive).
-        _native_slack_task_cards = False
+        _native_slack_task_cards = bool(
+            source.platform == Platform.SLACK and tool_progress_enabled
+            and resolve_display_setting(user_config, platform_key, "tool_progress_native")
+        )
         if source.platform == Platform.SLACK and hasattr(adapter, "native_task_cards_enabled"):
             try:
-                _native_slack_task_cards = bool(adapter.native_task_cards_enabled())
+                _native_slack_task_cards = bool(adapter.native_task_cards_enabled()) or _native_slack_task_cards
             except Exception:
                 logger.debug("Slack native task-card config check failed", exc_info=True)
         return self._RunAgentDisplay(
@@ -2754,6 +2757,10 @@ class GatewayTurnMixin:
             progress_queue=queue.Queue() if disp.needs_progress_queue else None,
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
+        )
+        turn_ctx._rich_slack_task_cards = bool(
+            source.platform == Platform.SLACK and disp.tool_progress_enabled
+            and disp.resolve_display_setting(disp.user_config, disp.platform_key, "tool_progress_native")
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Agent tool-lifecycle callbacks live on the runner (bound methods, same signatures).

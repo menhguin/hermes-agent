@@ -15,6 +15,14 @@ from typing import Any
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
+    # [CUSTOM] Rich Slack cards, carried from port-831 (5b474ad235).
+    # Separate opt-in from the adapter's stock basic cards; never affects other platforms.
+    "tool_progress_native": False,
+    "tool_progress_native_mode": "plan",
+    "tool_progress_native_rollover_age_s": 240,
+    "tool_progress_native_rollover_chars": 40_000,
+    "tool_progress_native_reasoning_chars": 0,
+    "tool_progress_native_output_chars": 0,
     "show_reasoning": False,
     "reasoning_style": "code",  # "code" (💭 **Reasoning:** + fence), "blockquote" ("> "), "subtext" ("-# " Discord)
     "tool_preview_length": 0,
@@ -149,6 +157,8 @@ def _norm_int(value: Any) -> int:
 
 _NORMALISERS: dict[str, Any] = {
     "tool_progress": _norm_tristate("all", "off", {"off", "new", "all", "verbose", "log"}),
+    "tool_progress_native": _norm_bool,
+    "tool_progress_native_mode": _norm_choice(("plan", "timeline", "dense")),
     "show_reasoning": _norm_bool,
     "streaming": _norm_bool,
     "interim_assistant_messages": _norm_bool,
@@ -166,5 +176,13 @@ _NORMALISERS: dict[str, Any] = {
 
 def _normalise(setting: str, value: Any) -> Any:
     """Normalise a user-supplied value for *setting*; unknown settings pass through."""
+    if setting in {
+        "tool_progress_native_rollover_age_s", "tool_progress_native_rollover_chars",
+        "tool_progress_native_reasoning_chars", "tool_progress_native_output_chars",
+    }:
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return _GLOBAL_DEFAULTS[setting]
     norm = _NORMALISERS.get(setting)
     return norm(value) if norm else value
