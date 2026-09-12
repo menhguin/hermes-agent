@@ -46,9 +46,17 @@ _INTERNAL_GATEWAY_TURN_RE = re.compile(
 )
 
 
+# Shared Slack sessions wrap internal events in a sender envelope too. Strip
+# one known transport prefix for detection only, never rewrite human content.
+_SLACK_SENDER_PREFIX_RE = re.compile(
+    r"^\s*\[[^\[\]\r\n]+ \| Slack user <@[UW][A-Z0-9]+>\][ 	]+"
+)
+
+
 def _is_internal_gateway_turn(text: str) -> bool:
     """Return True for machine-generated gateway/delegation notifications."""
-    return bool(_INTERNAL_GATEWAY_TURN_RE.match(text or ""))
+    text = _SLACK_SENDER_PREFIX_RE.sub("", text or "", count=1)
+    return bool(_INTERNAL_GATEWAY_TURN_RE.match(text))
 
 
 def _cfg_usable(cfg) -> bool:
@@ -641,12 +649,21 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
     def sync_turn(
         self, user_content: str, assistant_content: str, *, session_id: str = "",
         turn_author: Optional[Dict[str, Any]] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """Record the conversation turn in Honcho (non-blocking), chunking messages that
         exceed the Honcho API limit. Honors saveMessages: false. ``turn_author`` names who wrote
         the user side. The ``on_turn_start`` stash is the fallback for callers that never pass it.
         A bot author's turn is written into that bot's own a2a session, never the human's."""
         if not self._writes_enabled():
+            return
+        # MemoryManager offers typed origin metadata. Only the newest user
+        # row counts: historical notifications must not suppress a human turn.
+        current_user = next(
+            (msg for msg in reversed(messages or []) if msg.get("role") == "user"),
+            {},
+        )
+        if current_user.get("display_kind") == "internal_notification":
             return
         if _is_internal_gateway_turn(user_content):
             logger.debug("Honcho sync skipped machine-generated gateway turn")
