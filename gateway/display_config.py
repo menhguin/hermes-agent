@@ -158,6 +158,8 @@ def _norm_int(value: Any) -> int:
 _NORMALISERS: dict[str, Any] = {
     "tool_progress": _norm_tristate("all", "off", {"off", "new", "all", "verbose", "log"}),
     "tool_progress_native": _norm_bool,
+    # Legacy dense is accepted here; SlackTaskStream maps it to supported plan
+    # on the wire (chat.startStream documents only plan and timeline).
     "tool_progress_native_mode": _norm_choice(("plan", "timeline", "dense")),
     "show_reasoning": _norm_bool,
     "streaming": _norm_bool,

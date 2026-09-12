@@ -14,19 +14,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from plugins.platforms.slack.adapter import SlackAdapter
-
-
-class RecordingSlackClient:
-    def __init__(self):
-        self.calls = []
-        self.open_count = 0
-
-    async def api_call(self, method, *, json):
-        self.calls.append((method, json))
-        if method == "chat.startStream":
-            self.open_count += 1
-            return {"ok": True, "ts": f"joint-stream-{self.open_count}"}
-        return {"ok": True}
+from tests.gateway.slack_task_renderer import RenderingSlackClient
 
 
 @pytest.mark.asyncio
@@ -40,7 +28,7 @@ async def test_streamed_reasoning_materializes_once_and_disabled_reuse_cannot_re
     }}}}
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: config)
     adapter = SlackAdapter(PlatformConfig(enabled=True, extra={"mention_patterns": ["test-agent"]}))
-    client = RecordingSlackClient()
+    client = RenderingSlackClient()
     adapter._app = SimpleNamespace(client=client)
     adapter._team_clients["T_JOINT"] = client
     runner = object.__new__(GatewayRunner)
@@ -88,14 +76,9 @@ async def test_streamed_reasoning_materializes_once_and_disabled_reuse_cannot_re
     await asyncio.sleep(0)
     progress.cancel()
     await progress
-    chunks = [chunk for _, payload in client.calls for chunk in payload.get("chunks", [])]
-    # Slack task updates replace fields on the same card; repeated snapshots
-    # of that card are not independent visible deliveries.
-    rendered_cards = {}
-    for chunk in chunks:
-        if chunk.get("type") == "task_update":
-            rendered_cards.setdefault(chunk["id"], {}).update(chunk)
-    assert sum(card.get("details", "").count(thought) for card in rendered_cards.values()) == 1
+    # Details append on (stream ts, task id), while title/status replace.
+    # A repeated snapshot body would be a real duplicate, including at finalize.
+    assert sum(card.get("details", "").count(thought) for card in client.cards.values()) == 1
     assert client.open_count == 1
     assert client.calls[-1][0] == "chat.stopStream"
 

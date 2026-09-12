@@ -167,7 +167,8 @@ async def test_child_streams_are_ordered_and_closed_on_completion_and_turn_clean
     assert any(c.get("details") == "Found the result" for c in child_chunks)
     stopped = [p["ts"] for method, p in client.calls if method == "chat.stopStream"]
     assert sorted(stopped) == ["stream-1", "stream-2", "stream-3"]
-    assert all(p["task_display_mode"] == "dense" for m, p in client.calls if m == "chat.startStream")
+    # Legacy dense config is accepted, but Slack documents only plan/timeline.
+    assert all(p["task_display_mode"] == "plan" for m, p in client.calls if m == "chat.startStream")
     # Saved callbacks from the completed turn cannot reopen orphan streams or queue forever.
     turn.progress_callback("subagent.tool", "terminal", "late", subagent_id="child-b")
     turn.native_reasoning_callback("late reasoning")

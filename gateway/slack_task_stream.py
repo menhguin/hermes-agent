@@ -329,15 +329,15 @@ class SlackTaskStream:
     # threshold is a loose backstop, not the binding constraint.
     ROLLOVER_MAX_AGE_S = 290.0
     ROLLOVER_MAX_CHARS = 40_000
-    # Cap on accumulated 💭 reasoning text per card. 0 = uncapped, bounded
-    # only by SLACK_FIELD_CEILING below.
+    # Cap on accumulated 💭 details, including separator spaces. A positive
+    # budget covers the logical card/burst even across continuation messages;
+    # 0 preserves uncapped bursts (the per-chunk ceiling below still applies).
     REASONING_MAX_CHARS = 0
-    # Ceiling on the locally-kept reasoning copy (used for rollover replay).
+    # Ceiling on the locally-kept reasoning copy and each details chunk.
     # Probed 2026-07-05: single details chunks up to 32k accepted with no
     # error — the documented 12k limit applies to markdown_text, not
-    # task_update details. 30k keeps one card's replay chunk comfortably
-    # under the rollover size budget while being far beyond any realistic
-    # single thinking burst.
+    # task_update details. This is a carried, historically probed ceiling,
+    # not a newly verified public API guarantee.
     SLACK_FIELD_CEILING = 30_000
     # Minimum accumulated chars before a 💭 card is opened/updated.
     # The flush timer can cut a burst mid-word (observed: a card containing
@@ -345,15 +345,12 @@ class SlackTaskStream:
     # burst has substance. A pending fragment below this at finalize time
     # is carried into the next burst rather than emitted as its own card.
     REASONING_MIN_CHARS = 40
-    # Max chars of an OPEN 💭 card replayed onto a fresh stream at
-    # rollover. The full burst already lives on the closed card above
-    # ("⤵ continued below"); replaying it wholesale re-posted the whole
-    # thought and read as duplication (user-reported 2026-07-20). Only
-    # the tail carries continuation context. The full local copy in
-    # _reasoning_details is unaffected.
-    ROLLOVER_REASONING_TAIL = 500
+    # Reasoning bodies are not replayed at rollover: even a bounded tail
+    # duplicates text across messages. The title/continuation marker carries
+    # context; only not-yet-delivered reasoning continues on the fresh card.
     # Per-tool result preview length on finished cards. 0 (default) =
-    # no output previews — per Minh 2026-07-06: output previews get
+    # no API output field — result-derived summary titles remain enabled.
+    # Per Minh 2026-07-06: output previews get
     # skimmed past; reasoning is the signal. Set
     # tool_progress_native_output_chars to re-enable.
     OUTPUT_PREVIEW_CHARS = 0
@@ -382,11 +379,13 @@ class SlackTaskStream:
         self.thread_ts = thread_ts
         self.recipient_team_id = recipient_team_id
         self.recipient_user_id = recipient_user_id
-        self.task_display_mode = task_display_mode
+        # Slack documents plan/timeline only. Keep the legacy dense setting
+        # as a plan alias; there is no separate local dense renderer to preserve.
+        self.task_display_mode = "plan" if task_display_mode == "dense" else task_display_mode
         # Identity prefix for the card header ("carnie · a3f2c1 · 14:32").
         self.header_label = header_label
-        # Config-driven tuning (None → class default). reasoning cap of 0
-        # means uncapped; it is still clamped to SLACK_FIELD_CEILING.
+        # Config-driven tuning (None → class default). A positive reasoning
+        # budget is clamped to SLACK_FIELD_CEILING; 0 keeps uncapped bursts.
         if rollover_age_s is not None and rollover_age_s > 0:
             self.ROLLOVER_MAX_AGE_S = float(rollover_age_s)
         if rollover_chars is not None and rollover_chars > 0:
@@ -422,6 +421,10 @@ class SlackTaskStream:
         self._reasoning_unsent: str = ""
         self._reasoning_carry: str = ""
         self._reasoning_count = 0
+        # Actual appended details, including separator spaces, for this burst.
+        # A configured cap is not a per-delta allowance; rollover does not
+        # replenish it or re-expose a prefix that already exists above.
+        self._reasoning_sent_chars = 0
         # Per-subagent state (card id → {tools, number, start-time}) for the
         # numbered, timed delegate cards.
         self._subagents: dict[str, dict[str, Any]] = {}
@@ -431,9 +434,9 @@ class SlackTaskStream:
         # the new card (their task ids don't exist there otherwise).
         self._stream_opened_at = 0.0
         self._sent_chars = 0
-        # Last-sent size per card id, for net-delta size accounting (a
-        # task_update replaces its card, so only growth counts).
-        self._chunk_sizes: dict[str, int] = {}
+        # Rendered size per field on this stream. Details accumulate; omitted
+        # fields persist; title/status/output replace only when present.
+        self._chunk_sizes: dict[tuple[str, str], dict[str, int]] = {}
         self._rollovers = 0
         self._in_progress: dict[str, dict[str, Any]] = {}  # task_id → last-sent chunk
         # Serializes the open: tool events arrive back-to-back and each
@@ -714,21 +717,27 @@ class SlackTaskStream:
             self._reasoning_unsent = self._reasoning_carry
             self._reasoning_carry = ""
             self._reasoning_title = ""
+            self._reasoning_sent_chars = 0
         # ``details`` APPENDS across task_update chunks with the same id —
         # measured live 2026-07-05 (probe: two updates "AAA"/"BBB" stored
         # as "AAABBB"); title/status REPLACE. So each flush must send ONLY
         # the not-yet-sent delta, and Slack accumulates server-side.
         # Sending the full running text each flush rendered the
         # burst₁+(burst₁+burst₂)+… staircase duplication.
-        # _reasoning_details keeps the full local copy (rollover replay +
-        # finalize-before-stream-opens need it); _reasoning_unsent is the
-        # pending tail.
+        # _reasoning_details keeps the local copy for title/threshold checks;
+        # _reasoning_unsent is the pending tail, including before stream open.
         self._reasoning_details = (self._reasoning_details + " " + line).strip()
         self._reasoning_unsent = (self._reasoning_unsent + " " + line).strip()
         cap = self.SLACK_FIELD_CEILING
         if self.REASONING_MAX_CHARS > 0:
             cap = min(self.REASONING_MAX_CHARS, cap)
-        if len(self._reasoning_details) > cap:
+        if self.REASONING_MAX_CHARS > 0:
+            # Slack cannot replace an already-rendered prefix. Keep the head
+            # and admit only what still fits after successful details appends.
+            self._reasoning_details = self._reasoning_details[:cap]
+            remaining = max(0, cap - self._reasoning_sent_chars)
+            self._reasoning_unsent = self._reasoning_unsent[:remaining]
+        elif len(self._reasoning_details) > cap:
             clipped = self._reasoning_details[-cap:]
             sp = clipped.find(" ")
             self._reasoning_details = "…" + clipped[sp + 1 if 0 <= sp < 40 else 0:]
@@ -736,7 +745,7 @@ class SlackTaskStream:
         # ("I" as a whole card). Don't open/update the card until the
         # burst has substance; held text flushes with the next update or
         # carries into the next burst at finalize.
-        if len(self._reasoning_details) < self.REASONING_MIN_CHARS:
+        if len(self._reasoning_details) < min(self.REASONING_MIN_CHARS, cap):
             return
         # Title: short TLDR-style header (Claude-app rhythm — headers are
         # sub-sentence). First sentence of the thought, capped ~80 chars,
@@ -759,13 +768,23 @@ class SlackTaskStream:
         # joins but strips leading whitespace at some element boundaries
         # (the "reminders.Both" jam).
         sendable, tail = _split_complete_sentences(self._reasoning_unsent)
+        if self.REASONING_MAX_CHARS > 0 and len(self._reasoning_unsent) == remaining:
+            # At the budget boundary no future sentence can fit. A small cap
+            # must still render its prefix instead of waiting forever for 40
+            # characters or sentence punctuation outside the allowed budget.
+            sendable, tail = self._reasoning_unsent, ""
         if not sendable:
             return
         self._reasoning_unsent = tail
+        delta = sendable.rstrip() + " "
+        if self.REASONING_MAX_CHARS > 0:
+            delta = delta[:remaining]
         await self._append_raw_task(
             self._reasoning_open_id, self._reasoning_title,
-            status="in_progress", details=sendable.rstrip() + " ",
+            status="in_progress", details=delta,
         )
+        if not self.disabled:
+            self._reasoning_sent_chars += len(delta)
 
     async def _finalize_reasoning_card(self) -> None:
         """Settle the open 💭 card when the next tool starts.
@@ -777,7 +796,10 @@ class SlackTaskStream:
         """
         if self._reasoning_open_id is None:
             return
-        if len(self._reasoning_details) < self.REASONING_MIN_CHARS:
+        cap = self.SLACK_FIELD_CEILING
+        if self.REASONING_MAX_CHARS > 0:
+            cap = min(cap, self.REASONING_MAX_CHARS)
+        if len(self._reasoning_details) < min(self.REASONING_MIN_CHARS, cap):
             # Nothing was ever sent for this burst — roll it forward.
             self._reasoning_carry = self._reasoning_details
             self._reasoning_open_id = None
@@ -788,10 +810,14 @@ class SlackTaskStream:
         tail, self._reasoning_unsent = self._reasoning_unsent, ""
         self._reasoning_open_id = None
         self._reasoning_details = ""
+        delta = (tail.rstrip() + " ") if tail.strip() else ""
+        if self.REASONING_MAX_CHARS > 0:
+            delta = delta[:max(0, cap - self._reasoning_sent_chars)]
         await self._append_raw_task(
-            rid, title, status="complete",
-            details=(tail.rstrip() + " ") if tail.strip() else None,
+            rid, title, status="complete", details=delta or None,
         )
+        if not self.disabled:
+            self._reasoning_sent_chars += len(delta)
 
     async def set_plan_title(self, title: str) -> None:
         """Set/update the card's collapsible header via a plan_update chunk.
@@ -805,11 +831,7 @@ class SlackTaskStream:
             async with self._send_lock:
                 if self.disabled:
                     return
-                await self.client.chat_appendStream(
-                    channel=self.channel,
-                    ts=self.ts,
-                    chunks=[{"type": "plan_update", "title": str(title)[:250]}],
-                )
+                await self._send_chunk_locked({"type": "plan_update", "title": str(title)[:250]})
         except Exception as e:
             logger.info("plan_update failed (non-fatal): %s", e)
 
@@ -846,10 +868,10 @@ class SlackTaskStream:
                 "status": status,
             }
             if details:
-                cap = self.SLACK_FIELD_CEILING
-                if task_id.startswith("think") and self.REASONING_MAX_CHARS > 0:
-                    cap = min(cap, self.REASONING_MAX_CHARS)
-                chunk["details"] = str(details)[-cap:]
+                # Reasoning has already spent its cumulative budget at the
+                # reasoning boundary. Provider tool ids can also start with
+                # "think"; their bodies must not inherit the reasoning cap.
+                chunk["details"] = str(details)[-self.SLACK_FIELD_CEILING:]
             if output:
                 chunk["output"] = str(output)[:self.SLACK_FIELD_CEILING]
             if sources:
@@ -880,9 +902,15 @@ class SlackTaskStream:
                 if status == "in_progress":
                     prior = self._in_progress.get(task_id, {})
                     replay = dict(chunk)
-                    text = str(prior.get("details") or "") + str(chunk.get("details") or "")
-                    if text:
-                        replay["details"] = text[-self.SLACK_FIELD_CEILING:]
+                    if task_id == self._reasoning_open_id:
+                        # Continue reasoning by identity/title/status only. Its
+                        # body already lives on the previous message; even a
+                        # short tail replay duplicates text and spends budget.
+                        replay.pop("details", None)
+                    else:
+                        text = str(prior.get("details") or "") + str(chunk.get("details") or "")
+                        if text:
+                            replay["details"] = text[-self.SLACK_FIELD_CEILING:]
                     self._in_progress[task_id] = replay
                 else:
                     self._in_progress.pop(task_id, None)
@@ -897,16 +925,20 @@ class SlackTaskStream:
             ts=self.ts,
             chunks=[chunk],
         )
-        # Approximate the message-size budget by NET RENDERED content: a
-        # task_update with a known id REPLACES that card, so count only the
-        # size delta vs what that card previously held. Summing raw appends
-        # would explode on 💭 cards (each update re-sends the whole
-        # accumulated burst) and trigger spurious rollovers.
-        size = sum(len(str(v)) for v in chunk.values())
-        key = chunk.get("id") or f"__{chunk.get('type', 'chunk')}__"
-        prev = self._chunk_sizes.get(key, 0)
-        self._chunk_sizes[key] = size
-        self._sent_chars += max(0, size - prev)
+        # Approximate rendered characters, not wire traffic: details APPEND
+        # even when every delta has the same length. Other fields REPLACE,
+        # and an omitted field leaves its prior value intact. Count only
+        # accepted writes, so a rejected chunk retried after rollover is once.
+        key = (chunk.get("type", "chunk"), chunk.get("id", ""))
+        sizes = self._chunk_sizes.setdefault(key, {})
+        for field, value in chunk.items():
+            size = len(str(value))
+            if field == "details" and chunk.get("type") == "task_update":
+                self._sent_chars += size
+                sizes[field] = sizes.get(field, 0) + size
+            else:
+                self._sent_chars += size - sizes.get(field, 0)
+                sizes[field] = size
 
     async def _rollover_locked(self) -> None:
         """Close the current stream and continue on a fresh one.
@@ -956,11 +988,9 @@ class SlackTaskStream:
             "rollover: continued task cards on fresh stream ts=%s (rollover #%d)",
             self.ts, self._rollovers,
         )
-        # Replay the turn header and any in-flight tasks on the new card.
-        # The fresh card starts empty, so replayed chunks need FULL content:
-        # for the open 💭 card the tracked chunk only carries the last sent
-        # delta (details append server-side) — substitute the full local
-        # accumulated burst.
+        # Replay the header and in-flight task state on the new message.
+        # Reasoning replay state deliberately excludes already-sent details,
+        # including when rollover occurs inside the final completion update.
         replay: List[dict] = []
         if self._last_header:
             # Stamp the replayed header as a continuation (see
@@ -975,24 +1005,6 @@ class SlackTaskStream:
             replay.append({"type": "plan_update", "title": _title[:250]})
         for c in self._in_progress.values():
             chunk = dict(c)
-            if (
-                self._reasoning_open_id is not None
-                and chunk.get("id") == self._reasoning_open_id
-                and self._reasoning_details
-            ):
-                # Replay only the TAIL of the open 💭 card, not the full
-                # accumulated burst — the full text already lives on the
-                # closed card above, and re-posting it wholesale is what
-                # rendered as "thinking blocks repeat" (user-reported
-                # 2026-07-20). The local full copy is kept (future
-                # rollovers re-tail from it); only the replayed chunk is
-                # trimmed. Cut on a word boundary, mark with a leading …
-                tail = str(c.get("details") or "")
-                if len(tail) > self.ROLLOVER_REASONING_TAIL:
-                    tail = tail[-self.ROLLOVER_REASONING_TAIL:]
-                    sp = tail.find(" ")
-                    tail = "… " + tail[sp + 1 if 0 <= sp < 40 else 0:]
-                chunk["details"] = tail
             replay.append(chunk)
         for chunk in replay:
             await self._send_chunk_locked(chunk)
@@ -1143,6 +1155,12 @@ class RichTaskCardSession:
                   or f"{raw.get('delegation_id') or ''}:{raw.get('task_index', 0)}")
         if key in self.child_completed:
             return
+        terminal = event == "subagent.complete"
+        ok = raw.get("status") not in SUBAGENT_FAILURE_STATUSES
+        if terminal:
+            # Terminal state belongs to the child, not to the transport chosen
+            # below. A failed dedicated stream must not let late events revive it.
+            self.child_completed.add(key)
         goal = str(raw.get("goal") or raw.get("preview") or "subagent")
         child = self.children.get(key)
         if child is None:
@@ -1160,18 +1178,16 @@ class RichTaskCardSession:
             self.children[key] = child
             self.child_steps[key] = 0
             await child.task_started(0, "delegate_task", goal[:120])
-        if child.disabled:
-            await self.main.subagent_event(event, key, goal, raw.get("tool_name"))
-            return
-        if event == "subagent.tool" and raw.get("tool_name"):
+        # Dict insertion order is the same serial open order used by child
+        # headers. Preserve that number if this child moves to the main stream.
+        number = list(self.children).index(key) + 1
+        if not child.disabled and event == "subagent.tool" and raw.get("tool_name"):
             self.child_steps[key] += 1
             await child.task_started(
                 self.child_steps[key], raw["tool_name"], raw.get("preview"),
                 details=tool_details_from_args(raw["tool_name"], raw.get("args") or {}),
             )
-        elif event == "subagent.complete":
-            self.child_completed.add(key)
-            ok = raw.get("status") not in SUBAGENT_FAILURE_STATUSES
+        elif not child.disabled and terminal:
             count = self.child_steps[key]
             for index in range(count + 1):
                 await child.task_finished(index, "step", ok=ok)
@@ -1180,6 +1196,12 @@ class RichTaskCardSession:
             await child.task_started(count + 1, "delegate_task", "result", details=summary or None)
             await child.task_finished(count + 1, "delegate_task", float(raw.get("duration_seconds") or 0), ok,
                                       summary="✅ completed" if ok else "failed")
+        if child.disabled:
+            # Also catch a stream that failed DURING the current event, not just
+            # one that was already disabled on entry. Main-stream recovery must
+            # carry the actual terminal outcome instead of ok=True by default.
+            await self.main.subagent_event(event, key, goal, raw.get("tool_name"), ok=ok, number=number)
+        if terminal:
             await child.stop()
 
     async def _flush_reasoning(self):
