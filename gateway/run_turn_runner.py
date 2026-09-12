@@ -382,12 +382,16 @@ class TurnRunner:
                 )
                 st.egress_declined = True
                 return
+        if getattr(st, "rich", None) is not None and not st.rich.client.is_live():
+            return
         result = await self._send_progress_text(st, text)
         if getattr(result, "success", False) and getattr(result, "message_id", None):
             st.fallback_msg_id = str(result.message_id)
 
     async def _task_card_publish(self, st) -> None:
         ctx = self._ctx
+        if getattr(st, "rich", None) is not None and not st.rich.client.is_live():
+            return
         pending, st.pending = getattr(st, "pending", []), []
         if not st.tasks and not pending:
             return
@@ -403,6 +407,8 @@ class TurnRunner:
                     chat_id=ctx.source.chat_id, tasks=st.visible_tasks(), title="Hermes is working",
                     reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata, fallback_text=st.fallback_text(),
                 )
+            if getattr(st, "rich", None) is not None and not st.rich.client.is_live():
+                return  # invalidation during I/O is not a text-fallback failure
             if getattr(result, "success", False):
                 return
             # P5(b): an AUTHORIZATION decline is not a broken card lane. The
@@ -460,6 +466,7 @@ class TurnRunner:
                 st.rich = candidate if candidate.main is not None else None
             except Exception:
                 logger.warning("Rich card setup failed; using the adapter's native rail", exc_info=True)
+        publication = None
         try:
             while ctx._run_still_current():
                 try:
@@ -468,10 +475,28 @@ class TurnRunner:
                     await asyncio.sleep(0.1)
                     continue
                 if not self._agent_interrupted() and st.apply_event(raw):
-                    await self._task_card_publish(st)
+                    if st.rich is not None:
+                        # Cleanup cancels this consumer, not the only owner of
+                        # the popped append-only event. Never replay an append
+                        # whose acceptance is still unknown.
+                        publication = asyncio.create_task(self._task_card_publish(st))
+                        await asyncio.shield(publication)
+                        publication = None
+                    else:
+                        await self._task_card_publish(st)
         except asyncio.CancelledError:
-            if self._task_card_drain(st) and ctx._run_still_current() and not self._agent_interrupted():
-                await self._task_card_publish(st)
+            ctx._task_cards_closed = True
+            try:
+                if publication is not None:
+                    await asyncio.wait_for(publication, timeout=5.0)
+                if self._task_card_drain(st) and ctx._run_still_current() and not self._agent_interrupted():
+                    await asyncio.wait_for(self._task_card_publish(st), timeout=5.0 if st.rich is not None else None)
+            except asyncio.TimeoutError:
+                # Unknown acceptance is terminal for this rail: no replay,
+                # fallback, or reasoning flush after a timed-out publication.
+                st.native_failed = True
+                self._drain_progress_queue()
+                logger.warning("Timed out joining task-card publication during cleanup")
         finally:
             ctx._task_cards_closed = True
             if st.rich is not None:

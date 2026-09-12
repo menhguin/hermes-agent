@@ -1055,6 +1055,20 @@ class SlackTaskStream:
             logger.info("chat.stopStream failed: %s", e)
 
 
+def _redact_card_value(value: Any) -> Any:
+    """Scrub display copies before clipping; keep the canonical outbound policy."""
+    from agent.redact import redact_sensitive_text
+    if isinstance(value, str):
+        return redact_sensitive_text(value, force=True)
+    if isinstance(value, list):
+        return [_redact_card_value(item) for item in value]
+    if isinstance(value, dict):
+        # Scrub string bodies before JSON escaping, then named secret fields too.
+        clean = {key: _redact_card_value(item) for key, item in value.items()}
+        return json.loads(redact_sensitive_text(json.dumps(clean), force=True))
+    return value
+
+
 class _GuardedCardClient:
     """Use the direct adapter's workspace resolver and outbound guard on every call.
 
@@ -1063,9 +1077,17 @@ class _GuardedCardClient:
     never permission to borrow a client or bypass connector egress authorization.
     """
 
-    def __init__(self, adapter, channel, team_id):
+    def __init__(self, adapter, channel, team_id, ctx):
         self.adapter, self.channel, self.team_id = adapter, channel, team_id
+        self.ctx = ctx
         self.failure = None
+        self.halted = False
+
+    def is_live(self):
+        agent = self.ctx.agent_holder[0] if self.ctx.agent_holder else None
+        if not self.ctx._run_still_current() or (agent is not None and getattr(agent, "is_interrupted", False)):
+            self.halted = True
+        return not self.halted
 
     async def _call(self, method, payload):
         from gateway.platforms.base import SendResult
@@ -1078,6 +1100,24 @@ class _GuardedCardClient:
             raise RuntimeError(blocked.error)
         try:
             client = self.adapter._get_client(self.channel, team_id=self.team_id)
+            # Routing / task identity stays byte-stable. Only the newly exposed
+            # display fields pass through the forced user-facing redactor.
+            payload = dict(payload)
+            if "chunks" in payload:
+                payload["chunks"] = [
+                    {key: value if key in {"type", "id", "status"} else _redact_card_value(value)
+                     for key, value in chunk.items()}
+                    for chunk in payload["chunks"]
+                ]
+            for field in ("blocks", "markdown_text"):
+                if field in payload:
+                    payload[field] = _redact_card_value(payload[field])
+            if not self.is_live():
+                if method != "chat.stopStream":
+                    raise RuntimeError("Task-card turn no longer live")
+                # stopStream can append content too. A dead turn may only release
+                # an existing stream, never send a footer, reasoning or final text.
+                payload = {key: payload[key] for key in ("channel", "ts")}
             result = await client.api_call(method, json=payload)
             if result.get("ok") is False:
                 raise RuntimeError(result.get("error") or "Slack card request failed")
@@ -1117,7 +1157,6 @@ class RichTaskCardSession:
         self.child_steps = {}
         self.child_completed = set()
         self.reasoning = ""
-        self.reasoning_last = time.monotonic()
         self.closed = False
         # A relay adapter's guarded send_native_task_card_progress is its only
         # authorized egress seam; direct transport is deliberately unavailable.
@@ -1128,7 +1167,7 @@ class RichTaskCardSession:
         if key is None:
             return
         md = ctx._progress_metadata or {}
-        self.client = _GuardedCardClient(adapter, ctx.source.chat_id, key[0])
+        self.client = _GuardedCardClient(adapter, ctx.source.chat_id, key[0], ctx)
         cfg = ctx.user_config or {}
         settings = {name: resolve_display_setting(cfg, "slack", "tool_progress_native_" + suffix)
                     for name, suffix in {
@@ -1207,22 +1246,37 @@ class RichTaskCardSession:
     async def _flush_reasoning(self):
         pending, self.reasoning = self.reasoning, ""
         if pending and self.main is not None:
-            await self.main.reasoning_update(pending)
-        self.reasoning_last = time.monotonic()
+            await self.main.reasoning_update(_redact_card_value(pending))
 
     async def publish(self, events):
         from gateway.platforms.base import SendResult
-        if self.closed or self.main is None:
+        if self.closed or self.main is None or self.client is None:
             return SendResult(success=False, error="Rich cards require a direct Slack thread target")
         try:
             for raw in events:
+                if not self.client.is_live():
+                    return self.client.failure or SendResult(success=False, error="Task-card turn no longer live")
                 event = raw["type"]
                 if event == "reasoning.delta":
                     self.reasoning += raw["text"]
-                    if time.monotonic() - self.reasoning_last >= 2:
-                        await self._flush_reasoning()
+                    # Canonical redaction is whole-text (including multi-line
+                    # keys). Timer flushes can publish a prefix before its next
+                    # delta identifies it as a secret. Flush at the tool/turn
+                    # boundary, before the renderer normalizes or clips text.
                     continue
-                await self._flush_reasoning()
+                if not event.startswith("subagent."):
+                    # Child progress can interleave a main-model delta; it is
+                    # not a semantic boundary of that reasoning burst.
+                    await self._flush_reasoning()
+                raw = dict(raw)
+                for field in ("args", "result", "preview", "summary", "goal", "tool_name"):
+                    if field in raw:
+                        raw[field] = _redact_card_value(raw[field])
+                if raw.get("args") and raw.get("tool_name"):
+                    # Producers may have clipped preview in the middle of a
+                    # credential. Rebuild from the complete, now-safe args.
+                    from agent.display import build_tool_preview
+                    raw["preview"] = build_tool_preview(raw["tool_name"], raw["args"], max_len=64) or raw.get("preview")
                 if event.startswith("subagent."):
                     await self._subagent_event(raw)
                     continue
@@ -1251,6 +1305,9 @@ class RichTaskCardSession:
         if self.closed:
             return
         self.closed = True
+        flush_reasoning = bool(flush_reasoning and self.client is not None and self.client.is_live())
+        if self.client is not None and not flush_reasoning:
+            self.client.halted = True
         if self.main is not None:
             if flush_reasoning:
                 await self._flush_reasoning()
@@ -1260,7 +1317,9 @@ class RichTaskCardSession:
         # Closing every stream prevents orphan rollovers after /stop or agent reuse;
         # later async-child results use the upstream completion-notification turn.
         for child in self.children.values():
-            await child.stop()
+            await child.stop(flush_reasoning=flush_reasoning)
+        if self.client is not None:
+            self.client.halted = True
 
 
 __all__ = [
