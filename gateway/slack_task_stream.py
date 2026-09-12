@@ -1074,8 +1074,10 @@ def _redact_card_value(value: Any) -> Any:
             # Apply the native named-field policy to unescaped values. Regex
             # substitutions over serialized JSON can leave dangling escaped
             # quotes/backslashes; that text is neither safe nor parseable JSON.
+            # Exact vault sanitation must run before lossy head/tail masking:
+            # once masked, the registered full value cannot be recognized again.
             return {
-                _redact_card_value(key): _mask_token(item)
+                _redact_card_value(key): _mask_token(_redact_card_value(item))
                 if (isinstance(key, str) and isinstance(item, str)
                     and re.fullmatch(_JSON_KEY_NAMES, key, re.IGNORECASE)
                     and _should_redact_assignment(key, item, check_keyword=False))
