@@ -1226,6 +1226,20 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             @self._client.event
             async def on_ready():
                 logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
+                # Event tasks inherit connect()'s profile scope. Never borrow another
+                # profile's process-global activity in a multiplexed gateway.
+                activity_text = _scoped_gate_env("DISCORD_ACTIVITY").strip()
+                if activity_text:
+                    try:
+                        activity_type = _scoped_gate_env("DISCORD_ACTIVITY_TYPE", "playing").strip().lower()
+                        activity_factory = {
+                            "watching": lambda: discord.Activity(type=discord.ActivityType.watching, name=activity_text),
+                            "listening": lambda: discord.Activity(type=discord.ActivityType.listening, name=activity_text),
+                            "custom": lambda: discord.CustomActivity(name=activity_text),
+                        }.get(activity_type, lambda: discord.Game(name=activity_text))
+                        await adapter_self._client.change_presence(activity=activity_factory())
+                    except Exception as exc:
+                        logger.warning("[%s] Failed to set Discord activity: %s", adapter_self.name, exc)
                 await adapter_self._resolve_allowed_usernames()
                 adapter_self._ready_event.set()
                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
