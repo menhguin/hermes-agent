@@ -58,6 +58,7 @@ def make_adapter(fail=()):
 
 
 META = {"thread_id": "99.1", "team_id": "T1", "user_id": "U1"}
+FINAL_META = {**META, "_finalize_draft_id": 7}
 
 
 @pytest.mark.asyncio
@@ -98,7 +99,7 @@ async def test_sessions_status_and_title_use_modern_first_with_per_call_fallback
 async def test_authoritative_final_reconciles_stream_or_delivers_fallback(sent, final, fail):
     adapter, client = make_adapter(fail)
     await adapter.send_draft("D1", 7, sent, metadata=META)
-    result = await adapter.send("D1", final, metadata=META)
+    result = await adapter.send("D1", final, metadata=FINAL_META)
     assert result.success
     assert "D1" not in adapter._active_streams
     assert client.messages[result.message_id] == final
@@ -121,7 +122,7 @@ async def test_interim_send_does_not_seal_live_stream(content, status_notice):
     if status_notice:
         result = await adapter.send_or_update_status("D1", "progress", content, metadata=META)
     else:
-        result = await adapter.send("D1", content, metadata={**META, "_interim_send": True})
+        result = await adapter.send("D1", content, metadata={**FINAL_META, "_interim_send": True})
     assert result.success
     assert adapter._active_streams["D1"]["sent"] == "old prefix"
     assert client.open == {"100.1"}
@@ -194,7 +195,7 @@ async def test_native_stop_runs_inline_through_authorized_message_pipeline(user,
 async def test_failed_final_fallback_does_not_claim_delivery():
     adapter, client = make_adapter({"chat_stopStream", "chat_postMessage"})
     await adapter.send_draft("D1", 7, "old prefix", metadata=META)
-    result = await adapter.send("D1", "different final", metadata=META)
+    result = await adapter.send("D1", "different final", metadata=FINAL_META)
     assert not result.success
     assert client.open == {"100.1"}
     assert list(client.messages.values()) == ["old prefix"]
@@ -219,7 +220,7 @@ async def test_sessions_total_failure_is_retryable_and_title_not_cached():
 async def test_final_does_not_seal_another_workspace_or_thread(metadata):
     adapter, client = make_adapter()
     await adapter.send_draft("D1", 7, "old prefix", metadata=META)
-    await adapter.send("D1", "different final", metadata=metadata)
+    await adapter.send("D1", "different final", metadata={**metadata, "_finalize_draft_id": 7})
     assert client.open == {"100.1"}
     assert "D1" in adapter._active_streams
 
@@ -229,7 +230,7 @@ async def test_ignored_egress_cannot_seal_stream():
     adapter, client = make_adapter()
     await adapter.send_draft("D1", 7, "old prefix", metadata=META)
     adapter.config.extra["ignored_channels"] = ["D1"]
-    result = await adapter.send("D1", "different final", metadata=META)
+    result = await adapter.send("D1", "different final", metadata=FINAL_META)
     assert not result.success
     assert client.open == {"100.1"}
     assert len(client.calls) == 1

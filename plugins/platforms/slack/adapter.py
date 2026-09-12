@@ -2021,7 +2021,7 @@ class SlackAdapter(BasePlatformAdapter):
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        """Send a final message; progress/commentary must set metadata['_interim_send']."""
+        """Post a message, or seal the consumer-owned draft for an explicitly bound final."""
         blocked = self._outbound_blocked(chat_id, "outbound generic send to")
         if blocked:
             return blocked
@@ -2034,7 +2034,8 @@ class SlackAdapter(BasePlatformAdapter):
                 return await self._send_slash_reply(chat_id, slash_ctx, content, metadata)
             # An active native stream that this content finalizes IS the final
             # message: seal it instead of posting a duplicate.
-            stream_result = await self._try_finalize_stream(chat_id, content, metadata=metadata)
+            stream_result = await self._try_finalize_stream(
+                chat_id, content, metadata=metadata, reply_to=reply_to)
             if stream_result is not None:
                 return stream_result
             formatted = self.format_message(content)
@@ -2377,25 +2378,32 @@ class SlackAdapter(BasePlatformAdapter):
             return False
 
     async def _try_finalize_stream(
-        self, chat_id: str, content: str, metadata: Optional[Dict[str, Any]] = None
+        self, chat_id: str, content: str, metadata: Optional[Dict[str, Any]] = None,
+        *, reply_to: Optional[str] = None
     ) -> Optional[SendResult]:
-        """Finalize the authoritative send, never an explicitly marked interim send.
+        """Finalize only the draft owned by this consumer-declared final send.
 
+        Generic sends (including /btw, background notices, and other turns) do not
+        acquire ownership through matching routing, notify=True, or a text prefix.
         stopStream appends; a rewritten final must replace the sealed message by edit.
         A failed seal/edit falls back to normal delivery, NOT an exactly-once guarantee.
         """
-        if (metadata or {}).get("_interim_send"):
+        md = metadata or {}
+        draft_id = md.get("_finalize_draft_id")
+        if md.get("_interim_send") or draft_id is None:
             return None
         stream = self._active_streams.get(chat_id)
-        if stream is None:
+        if stream is None or draft_id != stream.get("draft_id"):
             return None
         sent = stream.get("sent", "")
         text = self._strip_stream_cursor(content)
-        # Never finalize another thread/workspace sharing this channel.
-        team_id = self._metadata_team_id(metadata)
-        thread_ts = self._resolve_thread_ts(None, metadata)
-        if (team_id and stream.get("team_id") and team_id != stream["team_id"]) or (
-                thread_ts and stream.get("thread_ts") and thread_ts != stream["thread_ts"]):
+        # Match the effective post destination, including reply_to and the flat-reply
+        # policy. Missing routing is not a wildcard; only a known channel/workspace
+        # association may fill a missing team, never the active stream itself.
+        team_id = self._metadata_team_id(metadata) or self._channel_team.get(chat_id)
+        thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        if (not team_id or team_id != stream.get("team_id")
+                or not thread_ts or thread_ts != stream.get("thread_ts")):
             return None
         self._active_streams.pop(chat_id, None)
         ts = stream["ts"]

@@ -258,6 +258,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+            if self._draft_id is not None:
+                # Bind the final send to the draft this consumer produced. Routing
+                # and notify=True are also used by independent side/background sends.
+                meta["_finalize_draft_id"] = self._draft_id
         return meta or None
 
     # Read-only views for the gateway (flag semantics: see _clear_turn_final_flags).

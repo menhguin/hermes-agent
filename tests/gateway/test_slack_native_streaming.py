@@ -42,7 +42,10 @@ def _make_adapter(extra=None):
     return a, client
 
 
-META = {"thread_id": "111.000", "user_id": "U123"}
+META = {"thread_id": "111.000", "user_id": "U123", "team_id": "T1"}
+# Adapter-level final tests explicitly bind the draft; the producer is exercised
+# end-to-end in test_slack_finalization_ownership.py.
+FINAL_META = {**META, "_finalize_draft_id": 7}
 
 
 class TestSupportsDraftStreaming:
@@ -170,7 +173,7 @@ class TestSendFinalization:
     async def test_final_send_seals_stream_no_duplicate_post(self):
         adapter, client = _make_adapter()
         await adapter.send_draft("D1", 7, "Hello wo", metadata=META)
-        result = await adapter.send("D1", "Hello world, done.", metadata=META)
+        result = await adapter.send("D1", "Hello world, done.", metadata=FINAL_META)
         assert result.success
         assert result.message_id == "123.456"
         kwargs = client.chat_stopStream.await_args.kwargs
@@ -182,7 +185,7 @@ class TestSendFinalization:
     async def test_final_send_equal_content_seals_without_delta(self):
         adapter, client = _make_adapter()
         await adapter.send_draft("D1", 7, "Hello world", metadata=META)
-        result = await adapter.send("D1", "Hello world", metadata=META)
+        result = await adapter.send("D1", "Hello world", metadata=FINAL_META)
         assert result.success
         kwargs = client.chat_stopStream.await_args.kwargs
         assert "markdown_text" not in kwargs
@@ -203,7 +206,7 @@ class TestSendFinalization:
         adapter, client = _make_adapter()
         await adapter.send_draft("D1", 7, "Hello", metadata=META)
         client.chat_stopStream = AsyncMock(side_effect=Exception("boom"))
-        result = await adapter.send("D1", "Hello world", metadata=META)
+        result = await adapter.send("D1", "Hello world", metadata=FINAL_META)
         assert result.success
         client.chat_postMessage.assert_awaited()
 
@@ -212,7 +215,7 @@ class TestSendFinalization:
         adapter, client = _make_adapter({"rich_blocks": True})
         rich = "# Title\n\nbody text"
         await adapter.send_draft("D1", 7, rich[:5], metadata=META)
-        result = await adapter.send("D1", rich, metadata=META)
+        result = await adapter.send("D1", rich, metadata=FINAL_META)
         assert result.success
         client.chat_update.assert_awaited()
         assert client.chat_update.await_args.kwargs["blocks"]
