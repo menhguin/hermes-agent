@@ -797,6 +797,16 @@ async def vision_analyze_tool(
     return await _run_analysis("image", image_url, user_prompt, model, stage)
 
 
+def check_image_requirements() -> bool:
+    """Native image attachment needs no auxiliary client; video still does."""
+    try:
+        if _should_use_native_vision_fast_path():
+            return True
+    except Exception as exc:
+        logger.debug("Native image availability check failed: %s", exc)
+    return check_vision_requirements()
+
+
 def check_vision_requirements() -> bool:
     """True when ``call_llm(task="vision")`` could resolve a client.
 
@@ -895,7 +905,7 @@ registry.register(
     toolset="vision",
     schema=VISION_ANALYZE_SCHEMA,
     handler=_handle_vision_analyze,
-    check_fn=check_vision_requirements,
+    check_fn=check_image_requirements,
     is_async=True,
     emoji="👁️")
 
