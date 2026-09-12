@@ -1069,6 +1069,23 @@ def _redact_card_value(value: Any) -> Any:
     return value
 
 
+def _redact_card_event(raw: dict) -> dict:
+    """Build a safe display copy for BOTH rich publication and text fallback.
+
+    Reasoning deltas are buffered separately until a semantic boundary. Complete
+    tool arguments are scrubbed before previews are shortened, so opaque vault
+    values cannot lose their recognizable suffix before reaching the redactor.
+    """
+    from agent.display import build_tool_preview
+    raw = dict(raw)
+    for field in ("args", "result", "preview", "summary", "goal", "tool_name"):
+        if field in raw:
+            raw[field] = _redact_card_value(raw[field])
+    if raw.get("args") and raw.get("tool_name"):
+        raw["preview"] = build_tool_preview(raw["tool_name"], raw["args"], max_len=64) or raw.get("preview")
+    return raw
+
+
 class _GuardedCardClient:
     """Use the direct adapter's workspace resolver and outbound guard on every call.
 
@@ -1268,15 +1285,7 @@ class RichTaskCardSession:
                     # Child progress can interleave a main-model delta; it is
                     # not a semantic boundary of that reasoning burst.
                     await self._flush_reasoning()
-                raw = dict(raw)
-                for field in ("args", "result", "preview", "summary", "goal", "tool_name"):
-                    if field in raw:
-                        raw[field] = _redact_card_value(raw[field])
-                if raw.get("args") and raw.get("tool_name"):
-                    # Producers may have clipped preview in the middle of a
-                    # credential. Rebuild from the complete, now-safe args.
-                    from agent.display import build_tool_preview
-                    raw["preview"] = build_tool_preview(raw["tool_name"], raw["args"], max_len=64) or raw.get("preview")
+                raw = _redact_card_event(raw)
                 if event.startswith("subagent."):
                     await self._subagent_event(raw)
                     continue

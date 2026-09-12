@@ -337,6 +337,9 @@ class TurnRunner:
                 "tool.started", "tool.completed", "reasoning.delta",
                 "subagent.start", "subagent.tool", "subagent.complete",
             }:
+                if event_type != "reasoning.delta":
+                    from gateway.slack_task_stream import _redact_card_event
+                    raw = _redact_card_event(raw)
                 self.pending.append(raw)
                 if event_type not in {"tool.started", "tool.completed"}:
                     return True
