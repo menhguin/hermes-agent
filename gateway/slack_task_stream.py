@@ -779,12 +779,24 @@ class SlackTaskStream:
         delta = sendable.rstrip() + " "
         if self.REASONING_MAX_CHARS > 0:
             delta = delta[:remaining]
-        await self._append_raw_task(
-            self._reasoning_open_id, self._reasoning_title,
-            status="in_progress", details=delta,
-        )
-        if not self.disabled:
-            self._reasoning_sent_chars += len(delta)
+        await self._append_reasoning_details(delta, status="in_progress")
+
+    async def _append_reasoning_details(self, delta: str, *, status: str) -> None:
+        """Split only already-sanitized text; the field ceiling is not a burst cap.
+
+        Keep the reasoning identity live until the LAST chunk is accepted, even
+        during finalization: rollover must replay identity, never delivered body.
+        """
+        for offset in range(0, max(1, len(delta)), self.SLACK_FIELD_CEILING):
+            part = delta[offset:offset + self.SLACK_FIELD_CEILING]
+            last = offset + self.SLACK_FIELD_CEILING >= len(delta)
+            await self._append_raw_task(
+                self._reasoning_open_id, self._reasoning_title,
+                status=status if last else "in_progress", details=part or None,
+            )
+            if self.disabled:
+                return
+            self._reasoning_sent_chars += len(part)
 
     async def _finalize_reasoning_card(self) -> None:
         """Settle the open 💭 card when the next tool starts.
@@ -806,18 +818,13 @@ class SlackTaskStream:
             self._reasoning_details = ""
             self._reasoning_unsent = ""
             return
-        rid, title = self._reasoning_open_id, self._reasoning_title
         tail, self._reasoning_unsent = self._reasoning_unsent, ""
-        self._reasoning_open_id = None
-        self._reasoning_details = ""
         delta = (tail.rstrip() + " ") if tail.strip() else ""
         if self.REASONING_MAX_CHARS > 0:
             delta = delta[:max(0, cap - self._reasoning_sent_chars)]
-        await self._append_raw_task(
-            rid, title, status="complete", details=delta or None,
-        )
-        if not self.disabled:
-            self._reasoning_sent_chars += len(delta)
+        await self._append_reasoning_details(delta, status="complete")
+        self._reasoning_open_id = None
+        self._reasoning_details = ""
 
     async def set_plan_title(self, title: str) -> None:
         """Set/update the card's collapsible header via a plan_update chunk.
@@ -1057,16 +1064,29 @@ class SlackTaskStream:
 
 def _redact_card_value(value: Any) -> Any:
     """Scrub display copies before clipping; keep the canonical outbound policy."""
-    from agent.redact import redact_sensitive_text
-    if isinstance(value, str):
-        return redact_sensitive_text(value, force=True)
-    if isinstance(value, list):
-        return [_redact_card_value(item) for item in value]
-    if isinstance(value, dict):
-        # Scrub string bodies before JSON escaping, then named secret fields too.
-        clean = {key: _redact_card_value(item) for key, item in value.items()}
-        return json.loads(redact_sensitive_text(json.dumps(clean), force=True))
-    return value
+    try:
+        from agent.redact import _JSON_KEY_NAMES, _mask_token, _should_redact_assignment, redact_sensitive_text
+        if isinstance(value, str):
+            return redact_sensitive_text(value, force=True)
+        if isinstance(value, list):
+            return [_redact_card_value(item) for item in value]
+        if isinstance(value, dict):
+            # Apply the native named-field policy to unescaped values. Regex
+            # substitutions over serialized JSON can leave dangling escaped
+            # quotes/backslashes; that text is neither safe nor parseable JSON.
+            return {
+                _redact_card_value(key): _mask_token(item)
+                if (isinstance(key, str) and isinstance(item, str)
+                    and re.fullmatch(_JSON_KEY_NAMES, key, re.IGNORECASE)
+                    and _should_redact_assignment(key, item, check_keyword=False))
+                else _redact_card_value(item)
+                for key, item in value.items()
+            }
+        return value
+    except Exception:
+        # A display-only redactor failure must not kill the event consumer or
+        # reuse tainted data (including exception messages) on the fallback rail.
+        return "[redacted: display unavailable]"
 
 
 def _redact_card_event(raw: dict) -> dict:
@@ -1082,7 +1102,20 @@ def _redact_card_event(raw: dict) -> dict:
         if field in raw:
             raw[field] = _redact_card_value(raw[field])
     if raw.get("args") and raw.get("tool_name"):
-        raw["preview"] = build_tool_preview(raw["tool_name"], raw["args"], max_len=64) or raw.get("preview")
+        if not isinstance(raw["args"], dict):
+            # A failed structural pass returns a safe placeholder, not args.
+            # The earlier preview may contain a clipped, unrecognizable secret;
+            # never reuse it when its authoritative arguments were discarded.
+            raw["args"] = {}
+            raw["preview"] = "[redacted: display unavailable]"
+        else:
+            try:
+                raw["preview"] = build_tool_preview(raw["tool_name"], raw["args"], max_len=64) or raw.get("preview")
+            except Exception:
+                # Preview builders can run their own redaction (browser input).
+                # Treat that failure just like discarded authoritative args.
+                raw["args"] = {}
+                raw["preview"] = "[redacted: display unavailable]"
     return raw
 
 
