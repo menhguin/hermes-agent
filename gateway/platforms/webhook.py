@@ -624,7 +624,7 @@ class WebhookAdapter(BasePlatformAdapter):
     # --- Signature validation ---
 
     def _validate_signature(self, request: "web.Request", body: bytes, secret: str) -> bool:
-        """Validate webhook signature (GitHub, GitLab, Svix, Standard Webhooks, Linear, generic HMAC-SHA256)."""
+        """Validate webhook signature (GitHub, GitLab, Svix, Standard Webhooks, Linear, Pocket, generic HMAC-SHA256)."""
         headers = request.headers
 
         def _header(name: str) -> str:
@@ -640,13 +640,30 @@ class WebhookAdapter(BasePlatformAdapter):
             svix = [_header(name) for name in ("webhook-id", "webhook-timestamp", "webhook-signature")]
         if any(svix):
             return _validate_svix_signature(body, secret, *svix)
-        # Linear (any header case): hex HMAC of the body. GitHub: sha256=<hex>. GitLab: plain token.
+        # Linear (any header case): hex HMAC of the body. GitHub: sha256=<hex>.
         for provided, expected in (
                 (_header("linear-signature"), lambda: _hex_hmac(secret, body)),
-                (headers.get("X-Hub-Signature-256", ""), lambda: "sha256=" + _hex_hmac(secret, body)),
-                (headers.get("X-Gitlab-Token", ""), lambda: secret)):
+                (headers.get("X-Hub-Signature-256", ""), lambda: "sha256=" + _hex_hmac(secret, body))):
             if provided:
                 return _hmac_str_equal(provided, expected())
+        # Pocket signs the exact millisecond timestamp header plus raw body.
+        # Either header's presence commits to Pocket; incomplete pairs must not
+        # downgrade to GitLab or generic body-only authentication.
+        pocket_sig = headers.get("X-HeyPocket-Signature")
+        pocket_ts = headers.get("X-HeyPocket-Timestamp")
+        if pocket_sig is not None or pocket_ts is not None:
+            if not pocket_sig or not pocket_ts:
+                return False
+            try:
+                timestamp_ms = int(pocket_ts)
+            except (ValueError, TypeError):
+                return False
+            if abs(time.time() * 1000 - timestamp_ms) > 300_000:
+                return False
+            return _hmac_str_equal(pocket_sig, _hex_hmac(secret, pocket_ts.encode() + b"." + body))
+        gitlab_token = headers.get("X-Gitlab-Token", "")
+        if gitlab_token:
+            return _hmac_str_equal(gitlab_token, secret)
         route_name = request.match_info.get("route_name", "")
         # Generic V2: X-Webhook-Signature-V2 = hex HMAC-SHA256 of "<timestamp>.<body>", X-Webhook-Timestamp
         # required. Presence of the V2 header COMMITS to V2 — it must not fall through to V1 on a
