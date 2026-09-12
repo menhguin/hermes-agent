@@ -42,11 +42,23 @@ async def test_reasoning_tuning_caps_wire_details_not_only_local_buffer():
 
 
 @pytest.mark.asyncio
-async def test_rollover_replays_only_prior_tasks_and_never_reappends_old_details():
+async def test_reasoning_only_turn_never_opens_a_progress_stream():
     client = SDKClient()
-    stream = SlackTaskStream(client, "C1", "thread", rollover_age_s=1)
+    stream = SlackTaskStream(client, "C1", "thread")
+    await stream.reasoning_update("This is a substantial thought with no tool call in the turn.")
+    await stream.stop()
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rollover_by", ["age", "chars"])
+async def test_rollover_replays_only_prior_tasks_and_never_reappends_old_details(rollover_by):
+    client = SDKClient()
+    stream = SlackTaskStream(client, "C1", "thread", rollover_age_s=1,
+                             rollover_chars=1 if rollover_by == "chars" else None)
     await stream.task_started("tool-a", "write_file", details="original payload")
-    stream._stream_opened_at -= 2
+    if rollover_by == "age":
+        stream._stream_opened_at -= 2
     await stream.task_started("tool-b", "write_file", details="new payload")
     await stream.stop()
     old = [c for _, p in client.calls if p.get("ts") == "stream-1" for c in p.get("chunks", [])]
