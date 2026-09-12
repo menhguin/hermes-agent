@@ -2302,6 +2302,7 @@ class TestSendTyping:
         a = SlackAdapter(config)
         a._app = MagicMock()
         a._app.client = AsyncMock()
+        a._app.client.api_call = AsyncMock(side_effect=RuntimeError("Agent Sessions unavailable"))
         a._app.client.assistant_threads_setStatus = AsyncMock()
         await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
         a._app.client.assistant_threads_setStatus.assert_called_once_with(
@@ -2322,6 +2323,7 @@ class TestSendTyping:
         a = SlackAdapter(config)
         a._app = MagicMock()
         a._app.client = AsyncMock()
+        a._app.client.api_call = AsyncMock(side_effect=RuntimeError("Agent Sessions unavailable"))
         a._app.client.assistant_threads_setStatus = AsyncMock()
         a.set_status_text("C123", "is reading docs/api.md…")
         await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
@@ -2343,6 +2345,7 @@ class TestSendTyping:
         static 'is thinking...' that reads as stuck."""
         import time as _time
 
+        adapter._app.client.api_call = AsyncMock(side_effect=RuntimeError("Agent Sessions unavailable"))
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
         clock = [1000.0]
         monkeypatch.setattr(_time, "monotonic", lambda: clock[0])
@@ -2366,6 +2369,7 @@ class TestSendTyping:
         """stop_typing ends the turn — the next turn starts a fresh clock."""
         import time as _time
 
+        adapter._app.client.api_call = AsyncMock(side_effect=RuntimeError("Agent Sessions unavailable"))
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
         clock = [2000.0]
         monkeypatch.setattr(_time, "monotonic", lambda: clock[0])
@@ -2385,6 +2389,7 @@ class TestSendTyping:
     @pytest.mark.asyncio
     async def test_sets_status_for_real_thread_when_reply_in_thread_false(self, adapter):
         adapter.config.extra["reply_in_thread"] = False
+        adapter._app.client.api_call = AsyncMock(side_effect=RuntimeError("Agent Sessions unavailable"))
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
 
         await adapter.send_typing(
@@ -2407,6 +2412,7 @@ class TestSendTyping:
         while Slack's persistent assistant status stays visible. A caller
         that names the exact thread must still be able to dismiss it (#32295).
         """
+        adapter._app.client.api_call = AsyncMock(side_effect=RuntimeError("Agent Sessions unavailable"))
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
         assert adapter._active_status_threads == {}
 
@@ -2430,6 +2436,7 @@ class TestSendTyping:
                 "D_SHARED",
                 metadata={"thread_id": "171.000", "slack_team_id": team_id},
             )
+        adapter._app.client.api_call = AsyncMock(side_effect=RuntimeError("Agent Sessions unavailable"))
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
 
         await adapter.stop_typing("D_SHARED", metadata={"thread_id": "171.000"})
@@ -2444,6 +2451,7 @@ class TestSendTyping:
         adapter._app.client.chat_postMessage = AsyncMock(
             return_value={"ts": "reply_ts"}
         )
+        adapter._app.client.api_call = AsyncMock(side_effect=RuntimeError("Agent Sessions unavailable"))
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
         adapter._active_status_threads[("", "C123", "parent_ts")] = {
             "thread_ts": "parent_ts",
@@ -2464,6 +2472,7 @@ class TestSendTyping:
 
     @pytest.mark.asyncio
     async def test_status_tracking_is_per_thread(self, adapter):
+        adapter._app.client.api_call = AsyncMock(side_effect=RuntimeError("Agent Sessions unavailable"))
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
 
         await adapter.send_typing("D123", metadata={"thread_id": "thread_a"})
@@ -2486,6 +2495,8 @@ class TestSendTyping:
     @pytest.mark.asyncio
     async def test_status_tracking_is_scoped_per_workspace(self, adapter):
         one, two = AsyncMock(), AsyncMock()
+        one.api_call = AsyncMock(side_effect=RuntimeError("Agent Sessions unavailable"))
+        two.api_call = AsyncMock(side_effect=RuntimeError("Agent Sessions unavailable"))
         adapter._team_clients.update({"T_ONE": one, "T_TWO": two})
 
         await adapter.send_typing(
@@ -2513,6 +2524,7 @@ class TestSendTyping:
     ):
         team_client = AsyncMock()
         team_client.chat_update = AsyncMock()
+        team_client.api_call = AsyncMock(side_effect=RuntimeError("Agent Sessions unavailable"))
         team_client.assistant_threads_setStatus = AsyncMock()
         adapter._team_clients["T_OTHER"] = team_client
         adapter._active_status_threads[("T_OTHER", "D123", "parent_ts")] = {
@@ -2551,6 +2563,7 @@ class TestSendTyping:
         ``if thread_ts: stop_typing`` clear entirely, leaving the assistant
         thread stuck "is thinking..." (#24117).
         """
+        adapter._app.client.api_call = AsyncMock(side_effect=RuntimeError("Agent Sessions unavailable"))
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
         adapter._active_status_threads[("", "C123", "parent_ts")] = {
             "thread_ts": "parent_ts",
@@ -3360,10 +3373,10 @@ class TestAssistantThreadLifecycle:
             {**event, "ts": "171.222", "thread_ts": "171.111"}
         )
 
-        assistant_adapter._app.client.assistant_threads_setTitle.assert_awaited_once_with(
-            channel_id="D123",
-            thread_ts="171.111",
-            title="Please summarize this incident thread",
+        assistant_adapter._app.client.api_call.assert_awaited_once_with(
+            "agents.sessions.rename",
+            json={"channel_id": "D123", "thread_ts": "171.111",
+                  "title": "Please summarize this incident thread"},
         )
         msg_event = assistant_adapter.handle_message.call_args[0][0]
         assert msg_event.metadata["slack_team_id"] == "T_TEAM"

@@ -192,7 +192,7 @@ class TestSendFinalization:
     async def test_unrelated_send_passes_through(self):
         adapter, client = _make_adapter()
         await adapter.send_draft("D1", 7, "Streaming text here", metadata=META)
-        result = await adapter.send("D1", "Unrelated notice", metadata=META)
+        result = await adapter.send("D1", "Unrelated notice", metadata={**META, "_interim_send": True})
         assert result.success
         client.chat_postMessage.assert_awaited()
         # Stream stays open for its own finalization.
