@@ -20,7 +20,7 @@ def digest(body):
 
 
 def validate(monkeypatch, headers):
-    monkeypatch.setattr(webhook.time, "time", lambda: NOW)
+    monkeypatch.setattr(webhook.time, "time", lambda: float(NOW))
     request = SimpleNamespace(headers=CIMultiDict(headers), match_info={"route_name": "test"})
     adapter = webhook.WebhookAdapter(PlatformConfig(enabled=True, extra={"routes": {}}))
     return adapter._validate_signature(request, BODY, SECRET)
@@ -53,4 +53,10 @@ def test_hmac_binds_exact_timestamp_representation(monkeypatch, timestamp):
                "X-HeyPocket-Signature": digest(timestamp.encode() + b"." + BODY)}
     assert validate(monkeypatch, headers) is True
     headers["X-HeyPocket-Timestamp"] = str(NOW * 1000)
+    assert validate(monkeypatch, headers) is False
+
+
+@pytest.mark.parametrize("timestamp", ["9" * 1000, "-" + "9" * 1000])
+def test_out_of_range_integer_timestamp_rejects_without_overflow(monkeypatch, timestamp):
+    headers = {"X-HeyPocket-Timestamp": timestamp, "X-HeyPocket-Signature": "bad"}
     assert validate(monkeypatch, headers) is False

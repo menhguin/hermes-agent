@@ -658,7 +658,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 timestamp_ms = int(pocket_ts)
             except (ValueError, TypeError):
                 return False
-            if abs(time.time() * 1000 - timestamp_ms) > 300_000:
+            now_ms = time.time() * 1000
+            # Compare bounds rather than subtracting: a huge attacker-supplied
+            # integer must reject, not overflow when coerced to a clock float.
+            if not now_ms - 300_000 <= timestamp_ms <= now_ms + 300_000:
                 return False
             return _hmac_str_equal(pocket_sig, _hex_hmac(secret, pocket_ts.encode() + b"." + body))
         gitlab_token = headers.get("X-Gitlab-Token", "")
