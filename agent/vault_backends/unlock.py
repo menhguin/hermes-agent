@@ -84,6 +84,11 @@ def set_current_session_id(session_id: Optional[str]) -> None:
     _current_session_tls.sid = session_id
 
 
+def get_current_session_id() -> Optional[str]:
+    """Current thread's owner, for surfaces that temporarily scope native prompts."""
+    return getattr(_current_session_tls, "sid", None)
+
+
 def _live(backend: str, *, touch: bool) -> Optional[str]:
     key = _key(backend)
     with _lock:

@@ -61,6 +61,7 @@ def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
     embed secret values — the fallback places the expression in subprocess
     argv. Use :func:`_eval_js_secret` for secret-bearing expressions.
     """
+    supervisor = None
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
@@ -70,11 +71,11 @@ def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
             if sup.get("ok"):
                 return {"success": True, "result": sup.get("result")}
             err = str(sup.get("error") or "")
-            if "supervisor" not in err.lower():
+            if getattr(supervisor, "target_id", None) is not None or "supervisor" not in err.lower():
                 return {"success": False, "error": err}
-    except ImportError:
-        pass
     except Exception as exc:  # pragma: no cover — defensive
+        if getattr(supervisor, "target_id", None) is not None:
+            return {"success": False, "error": "Bound browser inspection unavailable"}
         logger.debug("vault fill: supervisor eval unavailable (%s)", exc)
 
     from tools.browser_tool import _last_session_key
