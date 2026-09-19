@@ -1065,8 +1065,10 @@ class SlackTaskStream:
 def _redact_card_value(value: Any) -> Any:
     """Scrub display copies before clipping; keep the canonical outbound policy."""
     try:
-        from agent.redact import _JSON_KEY_NAMES, _mask_token, _should_redact_assignment, redact_for_egress
+        from agent.redact import _JSON_KEY_NAMES, _mask_token, _should_redact_assignment, redact_for_egress, redact_registered_vault_values
         if isinstance(value, str):
+            # Preserve complete vault matches before JSON splits their contents.
+            value = redact_registered_vault_values(value)
             # Tool results usually arrive serialized. Decode BEFORE text regexes
             # can split escaped secret values; retain a string display copy.
             try:
