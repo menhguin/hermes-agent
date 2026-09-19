@@ -14,7 +14,7 @@ from typing import Any
 
 from agent.chat_completion_helpers import _ToolCallAccumulator
 from agent.message_content import flatten_message_text
-from agent.reasoning_summaries import separate_glued_reasoning_blocks
+from agent.reasoning_summaries import ReasoningDeltaAccumulator
 
 
 def _tool_call_delta_view(tc_delta: Any) -> Any:
@@ -33,7 +33,7 @@ class RelayChatAccumulator:
 
     def __init__(self) -> None:
         self._content: list[str] = []
-        self._reasoning: list[str] = []
+        self._reasoning = ReasoningDeltaAccumulator()
         self._tool_calls = _ToolCallAccumulator()
         self._model = self._usage = self._finish_reason = None
         self._role = "assistant"
@@ -59,15 +59,14 @@ class RelayChatAccumulator:
             self._content.append(text)
         reasoning = delta.get("reasoning_content") or delta.get("reasoning")
         if reasoning:
-            self._reasoning.append(separate_glued_reasoning_blocks(
-                self._reasoning[-1] if self._reasoning else "", reasoning))
+            self._reasoning.feed(reasoning)
         for tc_delta in delta.get("tool_calls") or []:
             self._tool_calls.feed(_tool_call_delta_view(tc_delta))
 
     def finalize(self) -> dict[str, Any]:
         acc = self._tool_calls.materialize()
         message = {"role": self._role, "content": "".join(self._content) or None,
-            "reasoning_content": "".join(self._reasoning) or None,
+            "reasoning_content": "".join(self._reasoning.parts) or None,
             "tool_calls": [acc[i] for i in sorted(acc)] or None}
         # "stop" also covers Nous Portal ``lastOne`` usage frames, which carry no finish_reason.
         return {"model": self._model, "usage": self._usage,
