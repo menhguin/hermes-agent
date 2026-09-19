@@ -1599,6 +1599,7 @@ class SlackAdapter(BasePlatformAdapter):
             ("message", self._handle_slack_message), ("app_mention", self._handle_slack_message),
             ("app_home_opened", self._handle_app_home_opened),
             ("app_context_changed", self._handle_app_context_changed),
+            ("agent_session_stopped", self._handle_agent_session_stopped),
             ("file_shared", self._handle_slack_file_shared), ("file_created", _noop),
             ("file_change", _noop), ("reaction_added", _reaction(False)),
             ("reaction_removed", _reaction(True)),
@@ -2142,7 +2143,7 @@ class SlackAdapter(BasePlatformAdapter):
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        """Send a message to a Slack channel or DM."""
+        """Post a message, or seal the consumer-owned draft for an explicitly bound final."""
         blocked = self._outbound_blocked(chat_id, "outbound generic send to")
         if blocked:
             return blocked
@@ -2155,7 +2156,8 @@ class SlackAdapter(BasePlatformAdapter):
                 return await self._send_slash_reply(chat_id, slash_ctx, content, metadata)
             # An active native stream that this content finalizes IS the final
             # message: seal it instead of posting a duplicate.
-            stream_result = await self._try_finalize_stream(chat_id, content)
+            stream_result = await self._try_finalize_stream(
+                chat_id, content, metadata=metadata, reply_to=reply_to)
             if stream_result is not None:
                 return stream_result
             formatted = self.format_message(content)
@@ -2170,7 +2172,7 @@ class SlackAdapter(BasePlatformAdapter):
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             last_result = await self._post_chunks(chat_id, team_id, content, formatted, thread_ts)
             # Clear Slack Assistant status as soon as the final message is posted.
-            if thread_ts:
+            if thread_ts and not (metadata or {}).get("_interim_send"):
                 await self.stop_typing(chat_id, metadata=metadata)
             # Track sent ts (and the thread root) so thread replies get answered
             # without an @mention.
@@ -2296,7 +2298,8 @@ class SlackAdapter(BasePlatformAdapter):
                 return result
             # Edit failed: drop cached ts, fall through to a fresh send.
             self._status_message_ids.pop(key, None)
-        result = await self.send(chat_id, content, metadata=metadata)
+        result = await self.send(
+            chat_id, content, metadata={**(metadata or {}), "_interim_send": True})
         if result.success and result.message_id:
             if len(self._status_message_ids) >= self._STATUS_MESSAGE_IDS_MAX:
                 # FIFO trim: drop the oldest half to bound memory.
@@ -2401,7 +2404,7 @@ class SlackAdapter(BasePlatformAdapter):
         if self._native_stream_unsupported:
             return SendResult(success=False, error="native streaming unsupported")
         text = self._strip_stream_cursor(content)
-        client = self._get_client(chat_id)
+        client = self._client_for(chat_id, metadata)
         stream = self._active_streams.get(chat_id)
         try:
             if stream is not None and stream.get("draft_id") != draft_id:
@@ -2451,7 +2454,7 @@ class SlackAdapter(BasePlatformAdapter):
         start_kwargs: Dict[str, Any] = {"channel": chat_id, "thread_ts": thread_ts}
         md = metadata or {}
         user_id = md.get("user_id") or md.get("sender_id")
-        team_id = self._channel_team.get(chat_id)
+        team_id = self._metadata_team_id(metadata) or self._channel_team.get(chat_id)
         if user_id:
             start_kwargs["recipient_user_id"] = str(user_id)
         if team_id:
@@ -2463,7 +2466,8 @@ class SlackAdapter(BasePlatformAdapter):
         if not ts:
             raise RuntimeError("chat.startStream returned no ts")
         self._active_streams[chat_id] = {
-            "ts": str(ts), "draft_id": draft_id, "sent": text, "started": time.time()}
+            "ts": str(ts), "draft_id": draft_id, "sent": text, "started": time.time(),
+            "team_id": team_id or "", "thread_ts": thread_ts}
         self._bot_message_ts.add(str(ts))
         return SendResult(success=True, message_id=str(ts))
 
@@ -2481,24 +2485,40 @@ class SlackAdapter(BasePlatformAdapter):
                     kwargs["markdown_text"] = final_text[len(sent) :]
             if blocks:
                 kwargs["blocks"] = blocks
-            await self._get_client(chat_id).chat_stopStream(**kwargs)
+            await self._get_client(chat_id, team_id=stream.get("team_id")).chat_stopStream(**kwargs)
             return True
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(
                 "[Slack] chat.stopStream failed for %s/%s: %s", chat_id, stream.get("ts"), e)
             return False
 
-    async def _try_finalize_stream(self, chat_id: str, content: str) -> Optional[SendResult]:
-        """Seal the active native stream if ``content`` is its final text: SendResult when the
-        stream IS the final message; None when unrelated (interim commentary), leaving it open."""
+    async def _try_finalize_stream(
+        self, chat_id: str, content: str, metadata: Optional[Dict[str, Any]] = None,
+        *, reply_to: Optional[str] = None
+    ) -> Optional[SendResult]:
+        """Finalize only the draft owned by this consumer-declared final send.
+
+        Generic sends (including /btw, background notices, and other turns) do not
+        acquire ownership through matching routing, notify=True, or a text prefix.
+        stopStream appends; a rewritten final must replace the sealed message by edit.
+        A failed seal/edit falls back to normal delivery, NOT an exactly-once guarantee.
+        """
+        md = metadata or {}
+        draft_id = md.get("_finalize_draft_id")
+        if md.get("_interim_send") or draft_id is None:
+            return None
         stream = self._active_streams.get(chat_id)
-        if stream is None:
+        if stream is None or draft_id != stream.get("draft_id"):
             return None
         sent = stream.get("sent", "")
         text = self._strip_stream_cursor(content)
-        # Only claim sends that extend what was streamed; an empty ``sent``
-        # prefix would match everything.
-        if not sent or not text.startswith(sent):
+        # Match the effective post destination, including reply_to and the flat-reply
+        # policy. Missing routing is not a wildcard; only a known channel/workspace
+        # association may fill a missing team, never the active stream itself.
+        team_id = self._metadata_team_id(metadata) or self._channel_team.get(chat_id)
+        thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        if (not team_id or team_id != stream.get("team_id")
+                or not thread_ts or thread_ts != stream.get("thread_ts")):
             return None
         self._active_streams.pop(chat_id, None)
         ts = stream["ts"]
@@ -2506,17 +2526,25 @@ class SlackAdapter(BasePlatformAdapter):
         if not ok:
             # Stop failed — post normally; the dangling stream times out on Slack's side.
             return None
+        if not text.startswith(sent):
+            # chat.update replaces, whereas stopStream.markdown_text only appends.
+            # Do not claim delivery of an over-limit final truncated by edit_message.
+            if len(self.truncate_message(self.format_message(text), self.MAX_MESSAGE_LENGTH)) > 1:
+                return None
+            result = await self.edit_message(
+                chat_id, ts, text, finalize=True, metadata=metadata)
+            return result if result.success else None
         # Streams render markdown natively; rich blocks are applied via
         # chat_update on the sealed message (mirrors edit_message finalize).
         blocks = self._maybe_blocks(text)
         if blocks:
             try:
-                await self._get_client(chat_id).chat_update(
+                await self._client_for(chat_id, metadata).chat_update(
                     channel=chat_id, ts=ts, text=self.format_message(text), blocks=blocks)
             except Exception as e:
                 logger.debug(
                     "[Slack] Post-stream Block Kit update failed (markdown fallback stands): %s", e)
-        await self.stop_typing(chat_id)
+        await self.stop_typing(chat_id, metadata=metadata)
         return SendResult(success=True, message_id=ts)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -2564,12 +2592,23 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _set_thread_status(
         self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str) -> None:
-        """``assistant.threads.setStatus`` (empty ``status`` clears); failures are debug-logged."""
+        """Use lifecycle enums for Agent Sessions, free text for per-request legacy fallback."""
         try:
-            _set_status = _session_status_method(self._get_client(chat_id, team_id=team_id))
-            await _set_status(channel_id=chat_id, thread_ts=thread_ts, status=status)
+            client = self._get_client(chat_id, team_id=team_id)
+            _set_status = _session_status_method(client)
+            legacy = client.assistant_threads_setStatus
+            # agents.sessions.setStatus accepts active/processing/suspended/closed,
+            # not the arbitrary progress labels (or empty clear) of assistant.threads.
+            wire_status = status if _set_status == legacy else ("processing" if status else "active")
+            try:
+                await _set_status(channel_id=chat_id, thread_ts=thread_ts, status=wire_status)
+            except Exception as e:
+                if _set_status == legacy:
+                    raise
+                logger.debug("[Slack] agents.sessions.setStatus unavailable: %s", e)
+                await legacy(channel_id=chat_id, thread_ts=thread_ts, status=status)
         except Exception as e:
-            logger.debug("[Slack] assistant.threads.setStatus %s: %s", fail_label, e)
+            logger.debug("[Slack] session status %s: %s", fail_label, e)
 
     @staticmethod
     def _default_status_text(started: Optional[float]) -> str:
@@ -3547,8 +3586,16 @@ class SlackAdapter(BasePlatformAdapter):
             return
         title = title[:77].rstrip() + "..." if len(title) > 80 else title
         try:
-            _set_title = _session_title_method(self._get_client(channel_id, team_id=team_id))
-            await _set_title(channel_id=channel_id, thread_ts=thread_ts, title=title)
+            client = self._get_client(channel_id, team_id=team_id)
+            _set_title = _session_title_method(client)
+            try:
+                await _set_title(channel_id=channel_id, thread_ts=thread_ts, title=title)
+            except Exception as e:
+                if _set_title == client.assistant_threads_setTitle:
+                    raise
+                logger.debug("[Slack] agents.sessions.rename unavailable: %s", e)
+                await client.assistant_threads_setTitle(
+                    channel_id=channel_id, thread_ts=thread_ts, title=title)
         except Exception as e:
             logger.debug("[Slack] session title set failed: %s", e)
             return
@@ -4214,6 +4261,30 @@ class SlackAdapter(BasePlatformAdapter):
         """Mark ``ts`` for the reaction lifecycle, evicting oldest-ts-first past the cap."""
         self._reacting_message_ids.add(self._workspace_message_marker(team_id, ts))
         self._evict_oldest_by_ts(self._reacting_message_ids, self._REACTING_MESSAGE_IDS_MAX)
+
+    async def _handle_agent_session_stopped(
+        self, event: dict, body: Optional[dict] = None) -> None:
+        """Route the native Stop button through the authorized, inline /stop path.
+
+        Force-processing skips mentions only. Do not acknowledge by clearing status
+        here: a rejected stop must not hide another user's still-running session.
+        Slack must subscribe to agent_session_stopped for this listener to receive it.
+        """
+        channel_id = event.get("channel") or event.get("channel_id")
+        user_id = event.get("user") or event.get("user_id")
+        thread_ts = event.get("thread_ts")
+        if not channel_id or not user_id or not thread_ts:
+            return  # An incomplete control event must not target a different session.
+        synthetic = {
+            "type": "message", "text": "/stop", "channel": channel_id,
+            "user": user_id, "thread_ts": thread_ts,
+            "ts": event.get("ts") or event.get("event_ts") or "",
+            "team": self._event_team_id(event, body),
+            "_hermes_force_process": True,
+        }
+        if event.get("channel_type"):
+            synthetic["channel_type"] = event["channel_type"]
+        await self._handle_slack_message(synthetic, body)
 
     async def _handle_slack_message(self, event: dict, payload: Optional[dict] = None) -> None:
         """Guard around :meth:`_handle_slack_message_impl`: the impl claims the ts early (no second
