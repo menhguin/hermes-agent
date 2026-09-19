@@ -2786,15 +2786,16 @@ class GatewayTurnMixin:
         # (global, platform override, or legacy overrides) has asked for no tool progress at all and
         # gets no cards either. Every other explicit mode keeps the card lane.
         _native_slack_task_cards = False
-        if (
-            source.platform == Platform.SLACK
-            and hasattr(adapter, "native_task_cards_enabled")
-            and not (_tool_progress_explicit and progress_mode == "off")
-        ):
-            try:
-                _native_slack_task_cards = bool(adapter.native_task_cards_enabled())
-            except Exception:
-                logger.debug("Slack native task-card config check failed", exc_info=True)
+        if source.platform == Platform.SLACK and not (_tool_progress_explicit and progress_mode == "off"):
+            _native_slack_task_cards = bool(
+                tool_progress_enabled
+                and resolve_display_setting(user_config, platform_key, "tool_progress_native")
+            )
+            if hasattr(adapter, "native_task_cards_enabled"):
+                try:
+                    _native_slack_task_cards = bool(adapter.native_task_cards_enabled()) or _native_slack_task_cards
+                except Exception:
+                    logger.debug("Slack native task-card config check failed", exc_info=True)
         return self._RunAgentDisplay(
             user_config=user_config, platform_key=platform_key, enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets, resolve_display_setting=resolve_display_setting,
@@ -2857,6 +2858,10 @@ class GatewayTurnMixin:
             progress_queue=queue.Queue() if disp.needs_progress_queue else None,
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
+        )
+        turn_ctx._rich_slack_task_cards = bool(
+            source.platform == Platform.SLACK and disp.tool_progress_enabled
+            and disp.resolve_display_setting(disp.user_config, disp.platform_key, "tool_progress_native")
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Agent tool-lifecycle callbacks live on the runner (bound methods, same signatures).

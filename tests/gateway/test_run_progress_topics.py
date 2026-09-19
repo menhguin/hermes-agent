@@ -531,7 +531,8 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
         "thread_id": "1234567890.000001",
         "message_id": "1234567890.000001",
     }
-    assert adapter.sent[0]["metadata"] == expected_metadata
+    # Progress is interim, never the final response that seals a native draft.
+    assert adapter.sent[0]["metadata"] == {**expected_metadata, "_interim_send": True}
     assert all(call["metadata"] == expected_metadata for call in adapter.typing)
 
 

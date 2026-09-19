@@ -204,14 +204,10 @@ def _card_runner(adapter: _CardAdapter):
 
 
 def _card_state(adapter: _CardAdapter):
-    return SimpleNamespace(
-        tasks=[{"text": "step"}],
-        native_failed=False,
-        publication_suppressed=False,
-        visible_tasks=lambda: [{"text": "step"}],
-        fallback_text=lambda: "step",
-        adapter=adapter,
-    )
+    from gateway.run_turn_runner import TurnRunner
+    state = TurnRunner._TaskCardState(adapter)
+    state.apply_event({"type": "tool.started", "tool_call_id": "step", "tool_name": "terminal"})
+    return state
 
 
 def test_declined_task_card_progress_does_not_send_the_text_fallback():
@@ -224,7 +220,8 @@ def test_declined_task_card_progress_does_not_send_the_text_fallback():
     asyncio.run(runner._task_card_publish(st))
 
     assert adapter.fallbacks == []
-    assert st.native_failed is True
+    assert st.publication_suppressed is True
+    assert st.native_failed is False  # Refused destination, not broken transport.
 
 
 def test_ORDINARY_task_card_failure_still_sends_the_text_fallback():
