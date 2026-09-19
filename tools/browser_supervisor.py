@@ -58,7 +58,13 @@ def _schedule(coro, loop, *, timeout: float):
     fut = safe_schedule_threadsafe(coro, loop)
     if fut is None:
         raise _LoopUnavailable("Browser supervisor loop unavailable")
-    return fut.result(timeout=timeout)
+    try:
+        return fut.result(timeout=timeout)
+    except TimeoutError:
+        # Stop pending work as well as the caller's wait. Cancellation cannot
+        # recall a CDP command that has already been sent to the browser.
+        fut.cancel()
+        raise
 
 
 def _fail(error: str) -> Dict[str, Any]:
@@ -221,20 +227,33 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             return _err(e)
         return {"ok": True, "dialog": dialog.to_dict()}
 
+    def _evaluation_allowed(self) -> bool:
+        # Metadata checks may block; never run the callback on the CDP loop.
+        guard = getattr(self, "before_evaluate", None)
+        if guard is None:
+            return True
+        try:
+            return guard() is True
+        except Exception:
+            return False
+
+    def _origin_guarded_expression(self, expression: str) -> str:
+        # Close the navigation race between caller-thread policy and execution.
+        # Only connection-local opt-in consumers get this atomic in-page guard.
+        if getattr(self, "expected_origin", None) is not None:
+            return ("(() => {if (location.origin !== " + json.dumps(self.expected_origin)
+                    + ") throw new Error('Browser binding origin changed'); return (0,eval)("
+                    + json.dumps(expression) + ");})()")
+        return expression
+
     def evaluate_runtime(self, expression: str, *, return_by_value: bool = True,
                          await_promise: bool = True, timeout: float = 10.0) -> Dict[str, Any]:
         """Evaluate ``expression`` in the page's Runtime context over the live WS.
         Returns ``{"ok": True, "result", "result_type"}`` or ``{"ok": False, "error"}``.
         ``return_by_value=True`` JSON-serializes the result (DevTools-console
         semantics); non-serializable objects come back as a description string."""
-        guard = getattr(self, "before_evaluate", None)
-        if guard is not None:
-            try:
-                allowed = guard()
-            except Exception:
-                allowed = False
-            if allowed is not True:
-                return _fail("Browser binding is no longer valid")
+        if not self._evaluation_allowed():
+            return _fail("Browser binding is no longer valid")
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
@@ -245,12 +264,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         if not session_id:
             return _fail("supervisor has no attached page session")
 
-        if getattr(self, "expected_origin", None) is not None:
-            # Close the navigation race between the caller's metadata check and
-            # execution. Only connection-local opt-in consumers get this wrapper.
-            expression = ("(() => {if (location.origin !== " + json.dumps(self.expected_origin)
-                          + ") throw new Error('Browser binding origin changed'); return (0,eval)("
-                          + json.dumps(expression) + ");})()")
+        expression = self._origin_guarded_expression(expression)
 
         def _run_eval(by_value: bool) -> Dict[str, Any]:
             # userGesture: clipboard / fullscreen APIs need user activation.
@@ -311,9 +325,18 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                 await self._install_dialog_bridge(sid)
             return sid
 
-        async def _focus() -> Dict[str, Any]:
+        deadline = time.monotonic() + timeout + 1
+
+        def _run(coro):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                coro.close()
+                raise TimeoutError()
+            return _schedule(coro, loop, timeout=remaining)
+
+        def _focus() -> Dict[str, Any]:
             from agent.vault_store import normalize_origin
-            targets = (await self._cdp("Target.getTargets", timeout=timeout)).get("result", {}).get("targetInfos", [])
+            targets = _run(self._cdp("Target.getTargets", timeout=timeout)).get("result", {}).get("targetInfos", [])
             candidates = []
             for t in targets:
                 if self.target_id is not None and t.get("targetId") != self.target_id:
@@ -327,12 +350,15 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                 except Exception:
                     continue
             for target_id, url in candidates:
-                sid = await _attach(target_id)
+                sid = _run(_attach(target_id))
                 if accept:
-                    probe = await self._cdp("Runtime.evaluate", {"expression": accept, "returnByValue": True},
-                                            session_id=sid, timeout=timeout)
+                    if not self._evaluation_allowed():
+                        _run(self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout))
+                        return _fail("Browser binding is no longer valid")
+                    params = {"expression": self._origin_guarded_expression(accept), "returnByValue": True}
+                    probe = _run(self._cdp("Runtime.evaluate", params, session_id=sid, timeout=timeout))
                     if not probe.get("result", {}).get("result", {}).get("value"):
-                        await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
+                        _run(self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout))
                         continue
                 with self._state_lock:
                     self._page_session_id = sid
@@ -340,7 +366,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             return _fail(f"no open page on {origin or 'any site'}" + (" with the expected form" if accept and candidates else ""))
 
         try:
-            return _schedule(_focus(), loop, timeout=timeout + 1)
+            return _focus()
         except Exception as exc:
             return _err(exc)
 
@@ -657,6 +683,9 @@ def require_supervisor(task_id: str, supervisor: CDPSupervisor):
         yield
         requirement.check(task_id)
     finally:
+        # Captured contexts share this object even after the caller resets its
+        # ContextVar. No queued dispatch may retain an ended invocation's authority.
+        requirement.invalid = True
         _required_supervisor.reset(token)
 
 

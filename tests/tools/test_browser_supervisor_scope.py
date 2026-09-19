@@ -1,6 +1,7 @@
 """An explicit caller's supervisor requirement survives registry lifecycle changes."""
 import asyncio
 import threading
+from contextvars import copy_context
 from types import SimpleNamespace
 
 import pytest
@@ -96,6 +97,31 @@ def test_scope_is_task_profile_context_local_and_restored(connection, tmp_path):
                     bs.get_scoped_supervisor("bound")
             finally:
                 reset_hermes_home_override(token)
+    assert bs.get_scoped_supervisor("bound") is supervisor
+
+
+@pytest.mark.parametrize("error", [None, RuntimeError, KeyboardInterrupt])
+def test_exited_scope_revokes_captured_context_without_revoking_outer_scope(connection, error):
+    _, supervisor = connection
+    with bs.require_supervisor("bound", supervisor):
+        outer = copy_context()
+        captured = None
+        try:
+            with bs.require_supervisor("bound", supervisor):
+                captured = copy_context()
+                assert captured.run(bs.get_scoped_supervisor, "bound") is supervisor
+                if error is not None:
+                    raise error("synthetic handler exit")
+        except (RuntimeError, KeyboardInterrupt) as exc:
+            assert type(exc) is error
+        # Resetting a ContextVar alone leaves the captured invocation authorized.
+        assert captured is not None
+        with pytest.raises(bs.SupervisorBindingError):
+            captured.run(bs.get_scoped_supervisor, "bound")
+        assert outer.run(bs.get_scoped_supervisor, "bound") is supervisor
+        assert bs.get_scoped_supervisor("bound") is supervisor
+    with pytest.raises(bs.SupervisorBindingError):
+        outer.run(bs.get_scoped_supervisor, "bound")
     assert bs.get_scoped_supervisor("bound") is supervisor
 
 

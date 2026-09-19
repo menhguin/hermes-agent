@@ -214,6 +214,43 @@ def test_conflicting_scope_does_not_reuse_or_stop_existing_connection(wire, orig
     assert len(wire) == 1
 
 
+@pytest.mark.parametrize("second_allowed", [False, True])
+def test_focus_checks_policy_on_caller_thread_for_each_candidate(wire, monkeypatch, second_allowed):
+    import threading
+
+    supervisor = bs.get_or_start_supervisor("focus-policy", "ws://test", instrument_dialogs=False)
+    previous_session = supervisor._page_session_id
+    trace = wire[0].trace
+    trace.calls.clear()
+    original = CDPTrace.__call__
+
+    async def probe(self, method, params=None, *, session_id=None, timeout=10.0):
+        response = await original(self, method, params, session_id=session_id, timeout=timeout)
+        if method == "Runtime.evaluate":
+            return {"result": {"result": {"value": session_id == "session-selected"}}}
+        return response
+
+    monkeypatch.setattr(CDPTrace, "__call__", probe)
+    caller = threading.get_ident()
+    checked = []
+
+    def guard():
+        checked.append(threading.get_ident())
+        return len(checked) == 1 or second_allowed
+
+    supervisor.before_evaluate = guard
+    result = supervisor.focus_page("https://example.test", accept="document.querySelector('input')")
+    assert checked == [caller, caller]
+    assert result["ok"] is second_allowed
+    evaluations = [(params, sid) for method, params, sid in trace.calls if method == "Runtime.evaluate"]
+    expected_sessions = ["session-unrelated", "session-selected"] if second_allowed else ["session-unrelated"]
+    assert [sid for _, sid in evaluations] == expected_sessions
+    # Focus must retain probe semantics, not enable user gestures or await promises.
+    assert all(params == {"expression": "document.querySelector('input')", "returnByValue": True}
+               for params, _ in evaluations)
+    assert supervisor._page_session_id == ("session-selected" if second_allowed else previous_session)
+
+
 def test_start_timeout_closes_connection_and_stops_thread(monkeypatch, wire):
     import time
 
@@ -319,7 +356,9 @@ def disposable_chrome(tmp_path):
         chrome, "--headless=new", "--remote-debugging-port=0", f"--user-data-dir={profile}",
         "--no-first-run", "--no-default-browser-check", "--disable-gpu", "--no-sandbox",
         "--disable-background-networking", "--disable-component-update", "--disable-sync",
-        "--disable-extensions", "--disable-default-apps", "--disable-breakpad",
+        "--disable-extensions", "--disable-default-apps", "--disable-breakpad", "--no-proxy-server",
+        # A synthetic profile must not prompt for or use the host's keychain.
+        "--use-mock-keychain", "--password-store=basic",
         "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost, EXCLUDE 127.0.0.1", "about:blank",
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
        env={**os.environ, "HOME": str(tmp_path), "TMPDIR": str(tmp_path)})
@@ -358,6 +397,138 @@ def disposable_chrome(tmp_path):
             proc.kill()
             proc.wait(timeout=5)
 
+
+
+@pytest.fixture
+def local_focus_pages(disposable_chrome):
+    """Two same-origin synthetic form pages on a disposable localhost server."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    import time
+
+    class Form(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"<!doctype html><title>focus fixture</title><input name='synthetic'>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Form)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    browser_ws, _, call = disposable_chrome
+    origin = f"http://127.0.0.1:{server.server_port}"
+    pages = []
+    try:
+        for name in ("unrelated", "selected"):
+            target = call("Target.createTarget", {"url": "about:blank"})["targetId"]
+            sid = call("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
+            url = origin + "/" + name
+            call("Page.navigate", {"url": url}, sid)
+            deadline = time.monotonic() + 5
+            while True:
+                ready = call("Runtime.evaluate", {"expression":
+                    f"location.href === {json.dumps(url)} && document.readyState === 'complete'"}, sid)
+                if ready["result"].get("value") is True:
+                    break
+                assert time.monotonic() < deadline, "localhost fixture did not load"
+                time.sleep(0.02)
+            pages.append((target, sid))
+        yield browser_ws, origin, pages, call
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("policy", ["deny", "raise", "wrong-origin", "allow"])
+def test_bound_focus_enforces_policy_before_any_page_mutation(local_focus_pages, policy):
+    import threading
+
+    browser_ws, origin, pages, call = local_focus_pages
+    supervisor = bs.get_or_start_supervisor("guarded-focus", browser_ws, target_id=pages[-1][0],
+                                           instrument_dialogs=False, start_timeout=5)
+    previous_session = supervisor._page_session_id
+    checked = []
+
+    def guard():
+        checked.append(threading.get_ident())
+        if policy == "raise":
+            raise RuntimeError("private-policy-canary")
+        return policy != "deny"
+
+    supervisor.before_evaluate = guard
+    supervisor.expected_origin = origin.replace("127.0.0.1", "localhost") if policy == "wrong-origin" else origin
+    try:
+        with bs.require_supervisor("guarded-focus", supervisor):
+            result = supervisor.focus_page(origin, accept="(window.focusMutation = true, !!document.querySelector('input'))")
+        assert checked == [threading.get_ident()]
+        assert "private-policy-canary" not in str(result)
+        mutations = [call("Runtime.evaluate", {"expression": "!!window.focusMutation"}, sid)["result"]["value"]
+                     for _, sid in pages]
+        assert mutations == [False, policy == "allow"]
+        assert result["ok"] is (policy == "allow")
+        if policy != "allow":
+            assert supervisor._page_session_id == previous_session
+    finally:
+        bs.stop_supervisor("guarded-focus", expected=supervisor)
+
+
+@pytest.mark.integration
+def test_timed_out_queued_secret_evaluation_cannot_mutate_after_handler_returns(disposable_chrome, monkeypatch):
+    import threading
+    from agent import async_utils
+    from tools import browser_vault_tool as vault
+
+    browser_ws, _, call = disposable_chrome
+    selected = call("Target.createTarget", {"url": "about:blank"})["targetId"]
+    sid = call("Target.attachToTarget", {"targetId": selected, "flatten": True})["sessionId"]
+    supervisor = bs.get_or_start_supervisor("queued-vault", browser_ws, target_id=selected,
+                                           instrument_dialogs=False, start_timeout=5)
+    blocked, release = threading.Event(), threading.Event()
+    scheduled = []
+    schedule = async_utils.safe_schedule_threadsafe
+    evaluate = supervisor.evaluate_runtime
+
+    def record_schedule(*args, **kwargs):
+        future = schedule(*args, **kwargs)
+        scheduled.append(future)
+        return future
+
+    def block_loop():
+        blocked.set()
+        assert release.wait(timeout=10)
+
+    monkeypatch.setattr(async_utils, "safe_schedule_threadsafe", record_schedule)
+    monkeypatch.setattr(supervisor, "evaluate_runtime", lambda expression: evaluate(expression, timeout=1))
+    try:
+        assert supervisor._loop is not None
+        supervisor._loop.call_soon_threadsafe(block_loop)
+        assert blocked.wait(timeout=5)
+        with bs.require_supervisor("queued-vault", supervisor):
+            result = vault._eval_js_secret("queued-vault", "window.lateMutation = true")
+        pending = scheduled[0]
+        assert result["success"] is False and "TimeoutError" in result["error"]
+        assert not release.is_set()
+        before = call("Runtime.evaluate", {"expression": "!!window.lateMutation"}, sid)
+        assert before["result"]["value"] is False
+        release.set()
+        # A round trip on the SAME connection drains behind the queued command;
+        # unlike a sleep or a second socket alone, this orders the observation.
+        after = evaluate("!!window.lateMutation", timeout=5)
+        assert after["ok"] is True
+        assert after["result"] is False
+        assert pending.cancelled(), "A timed-out wait must cancel its scheduled future"
+        assert bs.get_scoped_supervisor("queued-vault") is supervisor
+    finally:
+        release.set()
+        bs.stop_supervisor("queued-vault", expected=supervisor)
 
 
 @pytest.mark.integration
