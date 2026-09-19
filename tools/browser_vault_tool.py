@@ -61,20 +61,25 @@ def _eval_js(task_id: str, expression: str) -> Dict[str, Any]:
     embed secret values — the fallback places the expression in subprocess
     argv. Use :func:`_eval_js_secret` for secret-bearing expressions.
     """
+    from tools.browser_supervisor import (
+        get_scoped_supervisor, SupervisorBindingError, _has_supervisor_requirement,
+    )
+
+    required = _has_supervisor_requirement()
     supervisor = None
     try:
-        from tools.browser_supervisor import SUPERVISOR_REGISTRY
-
-        supervisor = SUPERVISOR_REGISTRY.get(task_id)
+        supervisor = get_scoped_supervisor(task_id)
         if supervisor is not None:
             sup = supervisor.evaluate_runtime(expression)
             if sup.get("ok"):
                 return {"success": True, "result": sup.get("result")}
             err = str(sup.get("error") or "")
-            if getattr(supervisor, "target_id", None) is not None or "supervisor" not in err.lower():
+            if required or getattr(supervisor, "target_id", None) is not None or "supervisor" not in err.lower():
                 return {"success": False, "error": err}
+    except SupervisorBindingError:
+        return {"success": False, "error": "Bound browser inspection unavailable"}
     except Exception as exc:  # pragma: no cover — defensive
-        if getattr(supervisor, "target_id", None) is not None:
+        if required or getattr(supervisor, "target_id", None) is not None:
             return {"success": False, "error": "Bound browser inspection unavailable"}
         logger.debug("vault fill: supervisor eval unavailable (%s)", exc)
 
@@ -95,9 +100,9 @@ def _ensure_supervisor(task_id: str):
     a local agent-browser ``--session`` has no ``cdp_url`` of its own, so nothing did. Ask the daemon
     for the packaged Chromium's endpoint (``get cdp-url``: same daemon, same reaper) and attach.
     Returns None when no endpoint is reachable; the fill then refuses rather than touching argv."""
-    from tools.browser_supervisor import SUPERVISOR_REGISTRY
+    from tools.browser_supervisor import SUPERVISOR_REGISTRY, get_scoped_supervisor
 
-    supervisor = SUPERVISOR_REGISTRY.get(task_id)
+    supervisor = get_scoped_supervisor(task_id)
     if supervisor is not None:
         return supervisor
     from tools.browser_tool import _last_session_key

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from contextvars import ContextVar
 import json
 import logging
 import threading
@@ -456,6 +457,10 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
     async def _cdp(self, method: str, params: Optional[Dict[str, Any]] = None, *,
                    session_id: Optional[str] = None, timeout: float = 10.0) -> Dict[str, Any]:
         """Send a CDP command and await its response."""
+        # The caller's ContextVar follows run_coroutine_threadsafe onto this loop.
+        # Recheck here, after caller-thread guards and queued work, not just lookup.
+        if _required_supervisor.get() is not None and get_scoped_supervisor(self.task_id) is not self:
+            raise SupervisorBindingError()
         if self._ws is None:
             raise RuntimeError("supervisor WebSocket is not connected")
         call_id, self._next_call_id = self._next_call_id, self._next_call_id + 1
@@ -565,8 +570,16 @@ class _SupervisorRegistry:
             self._by_task[task_id] = supervisor
         return supervisor
 
-    def stop(self, task_id: str) -> None:
-        supervisor = self._pop(task_id)
+    def stop(self, task_id: str, *, expected: Optional[CDPSupervisor] = None) -> None:
+        if expected is None:
+            supervisor = self._pop(task_id)
+        else:
+            # An evicted connection still needs closing, but its replacement is
+            # another caller's resource. Compare-and-remove under the map lock.
+            with self._lock:
+                if self._by_task.get(task_id) is expected:
+                    self._by_task.pop(task_id)
+            supervisor = expected
         if supervisor is not None:
             supervisor.stop()
 
@@ -580,6 +593,71 @@ class _SupervisorRegistry:
 
 
 SUPERVISOR_REGISTRY = _SupervisorRegistry()
+
+
+class SupervisorBindingError(RuntimeError):
+    """A required connection was revoked; callers must not use native fallback."""
+
+    def __init__(self):
+        super().__init__("Required browser supervisor is no longer available")
+
+
+@dataclass
+class _SupervisorRequirement:
+    task_id: str
+    supervisor: CDPSupervisor
+    home: str
+    invalid: bool = False
+
+    def check(self, task_id: str) -> CDPSupervisor:
+        from hermes_constants import hermes_home_key
+
+        valid = (task_id == self.task_id and self.home == hermes_home_key()
+                 and SUPERVISOR_REGISTRY.get(task_id) is self.supervisor
+                 and not self.supervisor._stop_requested and self.supervisor.snapshot().active)
+        if not valid:
+            self.invalid = True
+        if self.invalid:
+            raise SupervisorBindingError()
+        return self.supervisor
+
+
+_required_supervisor: ContextVar[Optional[_SupervisorRequirement]] = ContextVar(
+    "required_browser_supervisor", default=None)
+
+
+def _has_supervisor_requirement() -> bool:
+    return _required_supervisor.get() is not None
+
+
+def get_scoped_supervisor(task_id: str) -> Optional[CDPSupervisor]:
+    """Select the required live connection, or the ordinary registry entry.
+
+    A missing/replaced required entry raises instead of returning None: None is
+    native callers' signal to start/fall back to an unrelated browser session.
+    """
+    requirement = _required_supervisor.get()
+    return requirement.check(task_id) if requirement is not None else SUPERVISOR_REGISTRY.get(task_id)
+
+
+@contextlib.contextmanager
+def require_supervisor(task_id: str, supervisor: CDPSupervisor):
+    """Pin a native handler invocation to this connection, without locking over UI.
+
+    Selection and each queued CDP dispatch revalidate identity/liveness. This also
+    protects metadata-only handlers on entry/exit. Revocation cannot recall a
+    command already sent, but never grants authority to a replacement connection.
+    """
+    from hermes_constants import hermes_home_key
+
+    requirement = _SupervisorRequirement(task_id, supervisor, hermes_home_key())
+    token = _required_supervisor.set(requirement)
+    try:
+        requirement.check(task_id)
+        yield
+        requirement.check(task_id)
+    finally:
+        _required_supervisor.reset(token)
 
 
 def get_or_start_supervisor(
@@ -599,13 +677,14 @@ def get_or_start_supervisor(
     )
 
 
-def stop_supervisor(task_id: str) -> None:
-    """Close only this task's supervisor connection, never its browser or pages."""
-    SUPERVISOR_REGISTRY.stop(task_id)
+def stop_supervisor(task_id: str, *, expected: Optional[CDPSupervisor] = None) -> None:
+    """Close this task's connection, or only ``expected`` even after eviction."""
+    SUPERVISOR_REGISTRY.stop(task_id, expected=expected)
 
 
 __all__ = ["CDPSupervisor", "SUPERVISOR_REGISTRY", "SupervisorSnapshot", "_SupervisorRegistry",
-           "get_or_start_supervisor", "stop_supervisor"]
+           "get_or_start_supervisor", "stop_supervisor", "get_scoped_supervisor",
+           "require_supervisor", "SupervisorBindingError"]
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
