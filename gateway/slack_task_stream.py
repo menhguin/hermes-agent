@@ -1102,7 +1102,9 @@ def _redact_card_value(value: Any) -> Any:
             except json.JSONDecodeError:
                 # Ordinary prose/markers are not JSON; no lossy pass ran yet.
                 return redact_for_egress(value)
-            if isinstance(decoded, (dict, list)):
+            # JSON strings can hide escaped vault values too. Each decoded
+            # string is strictly shorter, so recursive unwrapping terminates.
+            if isinstance(decoded, (dict, list, str)):
                 return json.dumps(_redact_card_value(decoded), ensure_ascii=False)
             return redact_for_egress(value)
         if isinstance(value, list):
