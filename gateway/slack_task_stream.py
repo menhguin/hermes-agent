@@ -373,6 +373,7 @@ class SlackTaskStream:
         reasoning_chars: Optional[int] = None,
         output_chars: Optional[int] = None,
         header_label: Optional[str] = None,
+        is_subagent: bool = False,
     ) -> None:
         self.client = client
         self.channel = channel
@@ -384,6 +385,7 @@ class SlackTaskStream:
         self.task_display_mode = "plan" if task_display_mode == "dense" else task_display_mode
         # Identity prefix for the card header ("carnie · a3f2c1 · 14:32").
         self.header_label = header_label
+        self._is_subagent = is_subagent
         # Config-driven tuning (None → class default). A positive reasoning
         # budget is clamped to SLACK_FIELD_CEILING; 0 keeps uncapped bursts.
         if rollover_age_s is not None and rollover_age_s > 0:
@@ -964,14 +966,15 @@ class SlackTaskStream:
             # stopping a stream with in_progress tasks makes Slack stamp
             # them with red warning triangles ("something went wrong"),
             # which reads as breakage when it's just a continuation
-            # (observed live 2026-07-05). Mark them complete with a ⤵
-            # suffix here; they're replayed as in_progress on the fresh
-            # card below.
+            # (observed live 2026-07-05). Unfinished children must remain
+            # pending, including dedicated child streams and fallback entries.
+            # The ⤵ suffix hands off to in_progress on the fresh card below;
+            # ordinary tool/reasoning segments retain their complete settlement.
             for tid, chunk in list(self._in_progress.items()):
                 # Settlement updates replace only title/status. Resending details
                 # here duplicates the whole card body on the old message.
                 settled = {k: chunk[k] for k in ("type", "id", "title")}
-                settled["status"] = "complete"
+                settled["status"] = "pending" if self._is_subagent or tid in self._subagents else "complete"
                 settled["title"] = f"{str(chunk.get('title', ''))[:240]} ⤵"
                 try:
                     await self.client.chat_appendStream(
@@ -1299,6 +1302,7 @@ class RichTaskCardSession:
                 rollover_age_s=self.main.ROLLOVER_MAX_AGE_S, rollover_chars=self.main.ROLLOVER_MAX_CHARS,
                 reasoning_chars=self.main.REASONING_MAX_CHARS, output_chars=self.main.OUTPUT_PREVIEW_CHARS,
                 header_label=f"🔀 SUBAGENT #{len(self.children) + 1} · {datetime.now().strftime('%H:%M')} · {goal[:60]}",
+                is_subagent=True,
             )
             self.children[key] = child
             self.child_steps[key] = 0
