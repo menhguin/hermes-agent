@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from contextvars import ContextVar
 import json
 import logging
 import threading
@@ -63,7 +64,13 @@ def _schedule(coro, loop, *, timeout: float):
     fut = safe_schedule_threadsafe(coro, loop)
     if fut is None:
         raise _LoopUnavailable("Browser supervisor loop unavailable")
-    return fut.result(timeout=timeout)
+    try:
+        return fut.result(timeout=timeout)
+    except TimeoutError:
+        # Stop pending work as well as the caller's wait. Cancellation cannot
+        # recall a CDP command that has already been sent to the browser.
+        fut.cancel()
+        raise
 
 
 def _fail(error: str) -> Dict[str, Any]:
@@ -94,17 +101,29 @@ class SupervisorSnapshot:
 
 
 class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
-    """One supervisor per (task_id, cdp_url) pair. ``start()`` spawns a daemon thread
-    running its own asyncio loop, connects, attaches to the first page target, enables
-    domains and auto-attach. ``snapshot()`` / ``respond_to_dialog()`` / ``evaluate_runtime()``
-    are sync, thread-safe bridges onto that loop; all CDP I/O lives on the loop."""
+    """A task-scoped CDP connection on its own thread and asyncio loop.
+
+    By default it finds/creates a page and instruments dialogs and child frames.
+    ``target_id`` binds attachment and focus to one exact page, including reconnects.
+    ``instrument_dialogs=False`` skips all event instrumentation while retaining
+    runtime evaluation. Public operations are sync bridges onto the loop.
+    Explicit-tab consumers may set ``before_evaluate`` (caller-thread predicate)
+    and ``expected_origin`` (atomic in-page guard) on their own connection.
+    """
 
     def __init__(self, task_id: str, cdp_url: str, *, dialog_policy: str = DEFAULT_DIALOG_POLICY,
-                 dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S) -> None:
+                 dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S,
+                 target_id: Optional[str] = None, instrument_dialogs: bool = True) -> None:
         if dialog_policy not in _VALID_POLICIES:
             raise ValueError(f"Invalid dialog_policy {dialog_policy!r}; must be one of {sorted(_VALID_POLICIES)}")
         self.task_id = task_id
         self.cdp_url = cdp_url
+        self.target_id = target_id
+        self.instrument_dialogs = instrument_dialogs
+        # Optional connection-local policy for explicit-tab consumers. The callback
+        # runs on the caller's thread before each Runtime evaluation (never logged).
+        self.before_evaluate: Optional[Callable[[], bool]] = None
+        self.expected_origin: Optional[str] = None
         self.dialog_policy = dialog_policy
         self.dialog_timeout_s = float(dialog_timeout_s)
 
@@ -116,6 +135,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         self._active = False
         # Supervisor loop machinery — populated in start().
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._run_task: Optional[asyncio.Task] = None
         self._thread: Optional[threading.Thread] = None
         self._ready_event = threading.Event()
         self._start_error: Optional[BaseException] = None
@@ -158,6 +178,11 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             # returns cleanly, ``_run`` hits its ``finally``, THEN the thread exits.
             with contextlib.suppress(Exception):  # loop already shutting down / close timed out
                 _schedule(self._close_ws(), loop, timeout=2.0)
+            # Closing the socket alone cannot wake an attachment still awaiting a
+            # CDP reply (or a connect/backoff). Cancel it before joining the thread.
+            if self._run_task is not None:
+                with contextlib.suppress(RuntimeError):  # loop closed during shutdown
+                    loop.call_soon_threadsafe(self._run_task.cancel)
         if self._thread is not None:
             self._thread.join(timeout=timeout)
         self._set_active(False)
@@ -208,12 +233,33 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             return _err(e)
         return {"ok": True, "dialog": dialog.to_dict()}
 
+    def _evaluation_allowed(self) -> bool:
+        # Metadata checks may block; never run the callback on the CDP loop.
+        guard = getattr(self, "before_evaluate", None)
+        if guard is None:
+            return True
+        try:
+            return guard() is True
+        except Exception:
+            return False
+
+    def _origin_guarded_expression(self, expression: str) -> str:
+        # Close the navigation race between caller-thread policy and execution.
+        # Only connection-local opt-in consumers get this atomic in-page guard.
+        if getattr(self, "expected_origin", None) is not None:
+            return ("(() => {if (location.origin !== " + json.dumps(self.expected_origin)
+                    + ") throw new Error('Browser binding origin changed'); return (0,eval)("
+                    + json.dumps(expression) + ");})()")
+        return expression
+
     def evaluate_runtime(self, expression: str, *, return_by_value: bool = True,
                          await_promise: bool = True, timeout: float = 10.0) -> Dict[str, Any]:
         """Evaluate ``expression`` in the page's Runtime context over the live WS.
         Returns ``{"ok": True, "result", "result_type"}`` or ``{"ok": False, "error"}``.
         ``return_by_value=True`` JSON-serializes the result (DevTools-console
         semantics); non-serializable objects come back as a description string."""
+        if not self._evaluation_allowed():
+            return _fail("Browser binding is no longer valid")
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
@@ -223,6 +269,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             return _fail("supervisor is not active")
         if not session_id:
             return _fail("supervisor has no attached page session")
+
+        expression = self._origin_guarded_expression(expression)
 
         def _run_eval(by_value: bool) -> Dict[str, Any]:
             # userGesture: clipboard / fullscreen APIs need user activation.
@@ -269,7 +317,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         that open their own tabs (browser_exec) put the login form somewhere else. With
         ``accept`` (a JS expression) the first same-origin tab where it evaluates truthy wins,
         so a login and a checkout tab on one site resolve to the right one. Returns
-        ``{"ok": True, "url"}`` or ``{"ok": False, "error"}``; on failure the previous session stays."""
+        ``{"ok": True, "url"}`` or ``{"ok": False, "error"}``; on failure the previous session stays.
+        With an explicit ``target_id``, only that page can qualify; another tab is never probed."""
         loop = self._loop
         if loop is None or not loop.is_running():
             return _fail("supervisor loop is not running")
@@ -277,15 +326,27 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         async def _attach(target_id: str) -> str:
             attach = await self._cdp("Target.attachToTarget", {"targetId": target_id, "flatten": True}, timeout=timeout)
             sid = attach["result"]["sessionId"]
-            await self._enable_page_domains(sid, timeout=timeout)
-            await self._install_dialog_bridge(sid)
+            if self.instrument_dialogs:
+                await self._enable_page_domains(sid, timeout=timeout)
+                await self._install_dialog_bridge(sid)
             return sid
 
-        async def _focus() -> Dict[str, Any]:
+        deadline = time.monotonic() + timeout + 1
+
+        def _run(coro):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                coro.close()
+                raise TimeoutError()
+            return _schedule(coro, loop, timeout=remaining)
+
+        def _focus() -> Dict[str, Any]:
             from agent.vault_store import normalize_origin
-            targets = (await self._cdp("Target.getTargets", timeout=timeout)).get("result", {}).get("targetInfos", [])
+            targets = _run(self._cdp("Target.getTargets", timeout=timeout)).get("result", {}).get("targetInfos", [])
             candidates = []
             for t in targets:
+                if self.target_id is not None and t.get("targetId") != self.target_id:
+                    continue
                 url = str(t.get("url") or "")
                 try:
                     # origin="" = any http(s) page (used to FIND the login tab before its origin is known)
@@ -295,12 +356,15 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                 except Exception:
                     continue
             for target_id, url in candidates:
-                sid = await _attach(target_id)
+                sid = _run(_attach(target_id))
                 if accept:
-                    probe = await self._cdp("Runtime.evaluate", {"expression": accept, "returnByValue": True},
-                                            session_id=sid, timeout=timeout)
+                    if not self._evaluation_allowed():
+                        _run(self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout))
+                        return _fail("Browser binding is no longer valid")
+                    params = {"expression": self._origin_guarded_expression(accept), "returnByValue": True}
+                    probe = _run(self._cdp("Runtime.evaluate", params, session_id=sid, timeout=timeout))
                     if not probe.get("result", {}).get("result", {}).get("value"):
-                        await self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout)
+                        _run(self._cdp("Target.detachFromTarget", {"sessionId": sid}, timeout=timeout))
                         continue
                 with self._state_lock:
                     self._page_session_id = sid
@@ -308,7 +372,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             return _fail(f"no open page on {origin or 'any site'}" + (" with the expected form" if accept and candidates else ""))
 
         try:
-            return _schedule(_focus(), loop, timeout=timeout + 1)
+            return _focus()
         except Exception as exc:
             return _err(exc)
 
@@ -320,7 +384,8 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
         self._loop = loop
         try:
             asyncio.set_event_loop(loop)
-            loop.run_until_complete(self._run())
+            self._run_task = loop.create_task(self._run())
+            loop.run_until_complete(self._run_task)
         except BaseException as e:  # noqa: BLE001 — propagate via _start_error
             if not self._fail_start(e):
                 logger.warning("CDP supervisor %s crashed: %s", self.task_id, e)
@@ -361,8 +426,11 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             return False
         logger.warning("CDP supervisor %s: stopped after %s failed reconnect attempts: %s",
                        self.task_id, failures, _redact_cdp_error_text(e))
-        if SUPERVISOR_REGISTRY.get(self.task_id) is self:
-            SUPERVISOR_REGISTRY._pop(self.task_id)
+        # Compare-and-remove atomically: a reconnect may publish a replacement
+        # between a separate registry lookup and pop. Never evict that resource.
+        with SUPERVISOR_REGISTRY._lock:
+            if SUPERVISOR_REGISTRY._by_task.get(self.task_id) is self:
+                SUPERVISOR_REGISTRY._by_task.pop(self.task_id)
         return True
 
     async def _run(self) -> None:
@@ -430,19 +498,27 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
             backoff = min(backoff * 2, 10.0)
 
     async def _attach_initial_page(self) -> None:
-        """Find (or create) a page target, attach flattened, enable domains, install dialog bridge."""
+        """Attach the exact bound page, or find/create a page for an unbound connection."""
         targets = (await self._cdp("Target.getTargets")).get("result", {}).get("targetInfos", [])
-        page_target = next((t for t in targets if t.get("type") == "page"), None)
+        page_target = next((t for t in targets if t.get("type") == "page"
+                            and (self.target_id is None or t.get("targetId") == self.target_id)), None)
         if page_target is None:
+            if self.target_id is not None:
+                raise RuntimeError(f"Bound page target {self.target_id!r} is not available")
             page_target = (await self._cdp("Target.createTarget", {"url": "about:blank"}))["result"]
         attach = await self._cdp("Target.attachToTarget", {"targetId": page_target["targetId"], "flatten": True})
         self._page_session_id = sid = attach["result"]["sessionId"]
-        await self._enable_page_domains(sid, timeout=10.0)
-        await self._install_dialog_bridge(sid)
+        if self.instrument_dialogs:
+            await self._enable_page_domains(sid, timeout=10.0)
+            await self._install_dialog_bridge(sid)
 
     async def _cdp(self, method: str, params: Optional[Dict[str, Any]] = None, *,
                    session_id: Optional[str] = None, timeout: float = 10.0) -> Dict[str, Any]:
         """Send a CDP command and await its response."""
+        # The caller's ContextVar follows run_coroutine_threadsafe onto this loop.
+        # Recheck here, after caller-thread guards and queued work, not just lookup.
+        if _required_supervisor.get() is not None and get_scoped_supervisor(self.task_id) is not self:
+            raise SupervisorBindingError()
         if self._ws is None:
             raise RuntimeError("supervisor WebSocket is not connected")
         call_id, self._next_call_id = self._next_call_id, self._next_call_id + 1
@@ -476,7 +552,7 @@ class CDPSupervisor(DialogSupervisionMixin, FrameTrackingMixin):
                         fut.set_exception(RuntimeError(f"CDP error on id={msg['id']}: {msg['error']}"))
                     else:
                         fut.set_result(msg)
-                elif handler := self._EVENT_HANDLERS.get(msg.get("method")):
+                elif self.instrument_dialogs and (handler := self._EVENT_HANDLERS.get(msg.get("method"))):
                     result = handler(self, msg.get("params", {}), msg.get("sessionId"))
                     if result is not None:
                         await result
@@ -506,12 +582,24 @@ class _SupervisorRegistry:
             return self._by_task.pop(task_id, None)
 
     def get_or_start(self, task_id: str, cdp_url: str, *, dialog_policy: str = DEFAULT_DIALOG_POLICY,
-                     dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S, start_timeout: float = 15.0) -> CDPSupervisor:
-        """Idempotently ensure a supervisor runs for ``(task_id, cdp_url)``; one bound to a
-        different ``cdp_url`` or unhealthy (dead thread / stopped loop) is stopped and replaced."""
+                     dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S, start_timeout: float = 15.0,
+                     target_id: Optional[str] = None, instrument_dialogs: bool = True) -> CDPSupervisor:
+        """Reuse healthy connections, replacing unhealthy ones with the same binding.
+
+        Bound/no-instrumentation connections reject endpoint or binding changes instead
+        of replacing another caller's connection. Legacy unbound endpoint replacement
+        remains unchanged. Use a distinct task id for an independent connection.
+        """
+        def check_binding(existing: CDPSupervisor) -> None:
+            binding = (target_id, instrument_dialogs)
+            if binding != (getattr(existing, "target_id", None), getattr(existing, "instrument_dialogs", True)) \
+                    or (binding != (None, True) and existing.cdp_url != cdp_url):
+                raise ValueError("Task already has a different supervisor binding; use a separate task_id")
+
         with self._lock:
             existing = self._by_task.get(task_id)
             if existing is not None:
+                check_binding(existing)
                 thread, loop = existing._thread, existing._loop
                 healthy = thread is not None and thread.is_alive() and loop is not None and loop.is_running()
                 if existing.cdp_url == cdp_url and healthy:
@@ -522,18 +610,34 @@ class _SupervisorRegistry:
 
         supervisor = CDPSupervisor(task_id=task_id, cdp_url=cdp_url,
                                    dialog_policy=dialog_policy, dialog_timeout_s=dialog_timeout_s)
+        supervisor.target_id = target_id
+        supervisor.instrument_dialogs = instrument_dialogs
         supervisor.start(timeout=start_timeout)
         with self._lock:
             # Guard against a concurrent get_or_start from another thread.
             already = self._by_task.get(task_id)
-            if already is not None and already.cdp_url == cdp_url:
-                supervisor.stop()
-                return already
+            if already is not None:
+                try:
+                    check_binding(already)
+                except ValueError:
+                    supervisor.stop()
+                    raise
+                if already.cdp_url == cdp_url:
+                    supervisor.stop()
+                    return already
             self._by_task[task_id] = supervisor
         return supervisor
 
-    def stop(self, task_id: str) -> None:
-        supervisor = self._pop(task_id)
+    def stop(self, task_id: str, *, expected: Optional[CDPSupervisor] = None) -> None:
+        if expected is None:
+            supervisor = self._pop(task_id)
+        else:
+            # An evicted connection still needs closing, but its replacement is
+            # another caller's resource. Compare-and-remove under the map lock.
+            with self._lock:
+                if self._by_task.get(task_id) is expected:
+                    self._by_task.pop(task_id)
+            supervisor = expected
         if supervisor is not None:
             supervisor.stop()
 
@@ -549,7 +653,99 @@ class _SupervisorRegistry:
 SUPERVISOR_REGISTRY = _SupervisorRegistry()
 
 
-__all__ = ["CDPSupervisor", "SUPERVISOR_REGISTRY", "SupervisorSnapshot", "_SupervisorRegistry"]
+class SupervisorBindingError(RuntimeError):
+    """A required connection was revoked; callers must not use native fallback."""
+
+    def __init__(self):
+        super().__init__("Required browser supervisor is no longer available")
+
+
+@dataclass
+class _SupervisorRequirement:
+    task_id: str
+    supervisor: CDPSupervisor
+    home: str
+    invalid: bool = False
+
+    def check(self, task_id: str) -> CDPSupervisor:
+        from hermes_constants import hermes_home_key
+
+        valid = (task_id == self.task_id and self.home == hermes_home_key()
+                 and SUPERVISOR_REGISTRY.get(task_id) is self.supervisor
+                 and not self.supervisor._stop_requested and self.supervisor.snapshot().active)
+        if not valid:
+            self.invalid = True
+        if self.invalid:
+            raise SupervisorBindingError()
+        return self.supervisor
+
+
+_required_supervisor: ContextVar[Optional[_SupervisorRequirement]] = ContextVar(
+    "required_browser_supervisor", default=None)
+
+
+def _has_supervisor_requirement() -> bool:
+    return _required_supervisor.get() is not None
+
+
+def get_scoped_supervisor(task_id: str) -> Optional[CDPSupervisor]:
+    """Select the required live connection, or the ordinary registry entry.
+
+    A missing/replaced required entry raises instead of returning None: None is
+    native callers' signal to start/fall back to an unrelated browser session.
+    """
+    requirement = _required_supervisor.get()
+    return requirement.check(task_id) if requirement is not None else SUPERVISOR_REGISTRY.get(task_id)
+
+
+@contextlib.contextmanager
+def require_supervisor(task_id: str, supervisor: CDPSupervisor):
+    """Pin a native handler invocation to this connection, without locking over UI.
+
+    Selection and each queued CDP dispatch revalidate identity/liveness. This also
+    protects metadata-only handlers on entry/exit. Revocation cannot recall a
+    command already sent, but never grants authority to a replacement connection.
+    """
+    from hermes_constants import hermes_home_key
+
+    requirement = _SupervisorRequirement(task_id, supervisor, hermes_home_key())
+    token = _required_supervisor.set(requirement)
+    try:
+        requirement.check(task_id)
+        yield
+        requirement.check(task_id)
+    finally:
+        # Captured contexts share this object even after the caller resets its
+        # ContextVar. No queued dispatch may retain an ended invocation's authority.
+        requirement.invalid = True
+        _required_supervisor.reset(token)
+
+
+def get_or_start_supervisor(
+    task_id: str, cdp_url: str, *, target_id: Optional[str] = None,
+    instrument_dialogs: bool = True, dialog_policy: str = DEFAULT_DIALOG_POLICY,
+    dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S, start_timeout: float = 15.0,
+) -> CDPSupervisor:
+    """Connect through the native task registry, optionally bound to one exact page.
+
+    Callers sharing a browser should use their own derived task id and pass
+    ``instrument_dialogs=False`` for a connection without dialog/frame instrumentation.
+    Native vault handlers can then find this connection by that same task id.
+    """
+    return SUPERVISOR_REGISTRY.get_or_start(
+        task_id, cdp_url, target_id=target_id, instrument_dialogs=instrument_dialogs,
+        dialog_policy=dialog_policy, dialog_timeout_s=dialog_timeout_s, start_timeout=start_timeout,
+    )
+
+
+def stop_supervisor(task_id: str, *, expected: Optional[CDPSupervisor] = None) -> None:
+    """Close this task's connection, or only ``expected`` even after eviction."""
+    SUPERVISOR_REGISTRY.stop(task_id, expected=expected)
+
+
+__all__ = ["CDPSupervisor", "SUPERVISOR_REGISTRY", "SupervisorSnapshot", "_SupervisorRegistry",
+           "get_or_start_supervisor", "stop_supervisor", "get_scoped_supervisor",
+           "require_supervisor", "SupervisorBindingError"]
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

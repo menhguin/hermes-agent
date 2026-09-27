@@ -10,6 +10,7 @@ from gateway.config import PlatformConfig
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
 from gateway.run_turn_runner import TurnRunner
+from gateway.turn_context import TurnContext
 from plugins.platforms.slack.adapter import SlackAdapter
 
 
@@ -61,7 +62,7 @@ async def run_progress(adapter, metadata, reply_to, after_first=None):
     events = Events()
     for event_type in ("tool.started", "tool.completed", "tool.completed"):
         events.put({"type": event_type, "tool_call_id": "call-1", "tool_name": "terminal"})
-    ctx = SimpleNamespace(
+    ctx = TurnContext(
         source=SimpleNamespace(chat_id="D1"), _progress_reply_to=reply_to,
         _progress_metadata=metadata, _cleanup_progress=False, progress_queue=events,
         tool_progress_enabled=False,  # Slack tier default: no text lane was asked for

@@ -39,7 +39,11 @@ re-creates a duplicate or frozen stream:
    resets at tool boundaries, or mrkdwn conversion. A non-prefix frame forces a whole-snapshot
    re-append ("stacked copies"). The finalize path may still transform the real final.
 2. **The consumer declares the final; the adapter never guesses.** `finish(final_text)` carries the
-   completed `final_response` (verifier footer, completion explainer included). New post-stream
+   completed `final_response` (verifier footer, completion explainer included). For direct Slack,
+   the consumer's final-send metadata binds `_finalize_draft_id` to its existing `draft_id`;
+   the adapter requires that owner AND a matching effective workspace/thread destination.
+   Routing, `notify=True`, a text prefix, and absence of `_interim_send` are not ownership:
+   `/btw` and background notices legitimately share a live turn's route. New post-stream
    augmentation MUST ride this payload — mutating `final_response` after the seal re-opens the
    `delivered_final_matches` mismatch → corrective duplicate send.
 3. **Interim sends carry `metadata["_interim_send"] = True`.** Any consumer-side `adapter.send()`

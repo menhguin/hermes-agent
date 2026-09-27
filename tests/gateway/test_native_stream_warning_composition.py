@@ -10,7 +10,7 @@ from gateway.run_turn_runner import TurnRunner
 from gateway.turn_context import TurnContext
 from gateway.session import SessionSource
 from gateway.config import Platform
-from tests.gateway.test_slack_native_streaming import _make_adapter, META
+from tests.gateway.test_slack_native_streaming import _make_adapter, META, FINAL_META
 
 
 @pytest.mark.asyncio
@@ -54,7 +54,7 @@ async def test_warning_and_media_failure_do_not_seal_requested_final(tmp_path, m
     assert client.chat_stopStream.await_count == 0
     assert "D1" in adapter._active_streams
     await adapter.send_draft("D1", 7, "Requested final", metadata=META)
-    result = await adapter.send("D1", "Requested final", metadata=META)
+    result = await adapter.send("D1", "Requested final", metadata=FINAL_META)
     assert result.success
     assert client.chat_startStream.await_count == 1
     assert client.chat_stopStream.await_count == 1
