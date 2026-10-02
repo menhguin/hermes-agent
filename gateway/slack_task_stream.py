@@ -216,6 +216,49 @@ def _split_complete_sentences(text: str) -> tuple[str, str]:
     return text[:cut], text[cut:].lstrip()
 
 
+def _reasoning_preview(text: str) -> str:
+    """Keep the existing first-sentence preview for summaries without headings."""
+    head = " ".join(text.split())
+    for sep in (". ", "! ", "? ", " — "):
+        idx = head.find(sep)
+        if 0 < idx < 120:
+            head = head[:idx + 1].rstrip(" —")
+            break
+    return _word_trim(head, 80)
+
+
+_REASONING_HEADING_RE = re.compile(r"\*\*([^*\n]+)\*\*|^#{1,6}[ \t]+([^\n]+)", re.MULTILINE)
+
+
+def _completed_reasoning_rows(text: str) -> list[tuple[str, str]]:
+    """Separate explicit summary headings only after whole-burst redaction.
+
+    Providers may concatenate heading-only parts without a delimiter. Split
+    those only when the ENTIRE burst is headings; bold phrases inside prose
+    are not new steps. Unrecognized text remains intact in the body.
+    """
+    headings = list(_REASONING_HEADING_RE.finditer(text))
+    only_headings = headings and not _REASONING_HEADING_RE.sub("", text).strip()
+    parts = [match[0] for match in headings] if only_headings else [text]
+    rows = []
+    for part in parts:
+        heading = _REASONING_HEADING_RE.match(part)
+        label = (heading[1] or heading[2]).strip() if heading else ""
+        remainder = part[heading.end():].lstrip(" \t") if heading else ""
+        if heading and label and (not remainder or remainder.startswith(("\n", "\r\n"))):
+            # Strip heading-line spacing separately so body indentation survives.
+            body = remainder.lstrip("\r\n")
+            title = _word_trim(label, 80)
+            if title != label:
+                # Only the undisplayed suffix belongs in details, not a second
+                # copy of the visible heading. Preserve overflow even without prose.
+                body = label[len(title) - 1:] + ("\n\n" + body if body else "")
+            rows.append((title, body))
+        else:
+            rows.append(("", part))
+    return rows
+
+
 def tool_details_from_args(tool_name: str, args: Any) -> Optional[str]:
     """Optional collapsible-body preview extracted from the tool's args."""
     key = _CONTENT_ARG_BY_TOOL.get(tool_name)
@@ -342,8 +385,8 @@ class SlackTaskStream:
     # Minimum accumulated chars before a 💭 card is opened/updated.
     # The flush timer can cut a burst mid-word (observed: a card containing
     # just "I"); tiny fragments carry no signal, so hold them until the
-    # burst has substance. A pending fragment below this at finalize time
-    # is carried into the next burst rather than emitted as its own card.
+    # burst has substance. A semantic/tool/turn boundary settles even a short
+    # burst: carrying it forward merges unrelated steps or loses the last one.
     REASONING_MIN_CHARS = 40
     # Reasoning bodies are not replayed at rollover: even a bounded tail
     # duplicates text across messages. The title/continuation marker carries
@@ -414,14 +457,13 @@ class SlackTaskStream:
         # Interleaved reasoning cards: each burst of thinking between tool
         # calls gets its own 💭 card in the timeline (updated in place while
         # the burst continues, finalized when the next tool starts). The
-        # title carries the rolling tail of the thought; the card's DETAILS
-        # carries the full burst text (titles are capped ~255 by Slack,
-        # details can hold far more — that's where full reasoning lives).
+        # title carries an explicit summary heading or a first-sentence preview;
+        # details hold the explanation/overflow without repeating a heading.
         self._reasoning_open_id: Optional[str] = None
         self._reasoning_title: str = ""
         self._reasoning_details: str = ""
         self._reasoning_unsent: str = ""
-        self._reasoning_carry: str = ""
+        self._reasoning_completed = False
         self._reasoning_count = 0
         # Actual appended details, including separator spaces, for this burst.
         # A configured cap is not a per-delta allowance; rollover does not
@@ -586,6 +628,8 @@ class SlackTaskStream:
             return
         if not await self.ensure_started():
             return
+        # Completion-only events can be the first tool boundary on a runtime.
+        await self._finalize_reasoning_card()
         # Prefer a descriptive summary ("Read → 5 results for X") over the
         # start-time arg echo; fall back to the stored start title.
         if summary:
@@ -678,7 +722,7 @@ class SlackTaskStream:
             suffix = "" if ok else " · ✗ failed"
             await self._append_raw_task(sid, _title(suffix), status="complete")
 
-    async def reasoning_update(self, text: str) -> None:
+    async def reasoning_update(self, text: str, *, completed: bool = False) -> None:
         """Render the model's thinking as interleaved 💭 cards in the timeline.
 
         Each burst of reasoning between tool calls gets its own card,
@@ -698,6 +742,11 @@ class SlackTaskStream:
         Everything overflowing the title lives in details, which carries
         the full accumulated burst (uncapped by default).
 
+        ``completed`` is reserved for the rich publisher's whole redacted burst
+        at a semantic/tool/turn boundary, not individual provider callbacks.
+        Explicit headings are split from their bodies only in that path, before
+        any append-only details escape. Paragraphs remain intact.
+
         Before the stream opens (thinking that precedes the first tool call
         — i.e. every turn's opening thought), the burst is BUFFERED rather
         than dropped: state is updated but no API call is made, and the
@@ -705,19 +754,16 @@ class SlackTaskStream:
         still reads thought ✓ → tool. A turn with zero tool calls never
         opens a stream, so its reasoning is never rendered — intentional.
         """
-        if self.disabled:
+        if self.disabled or self._stopped:
             return
-        line = " ".join(str(text).split())
+        line = str(text).strip() if completed else " ".join(str(text).split())
         if not line:
             return
         if self._reasoning_open_id is None:
             self._reasoning_count += 1
             self._reasoning_open_id = f"think{self._reasoning_count}"
-            # Carry any sub-threshold fragment from the previous burst
-            # (see _finalize_reasoning_card) instead of starting empty.
-            self._reasoning_details = self._reasoning_carry
-            self._reasoning_unsent = self._reasoning_carry
-            self._reasoning_carry = ""
+            self._reasoning_details = ""
+            self._reasoning_unsent = ""
             self._reasoning_title = ""
             self._reasoning_sent_chars = 0
         # ``details`` APPENDS across task_update chunks with the same id —
@@ -730,6 +776,7 @@ class SlackTaskStream:
         # _reasoning_unsent is the pending tail, including before stream open.
         self._reasoning_details = (self._reasoning_details + " " + line).strip()
         self._reasoning_unsent = (self._reasoning_unsent + " " + line).strip()
+        self._reasoning_completed = completed
         cap = self.SLACK_FIELD_CEILING
         if self.REASONING_MAX_CHARS > 0:
             cap = min(self.REASONING_MAX_CHARS, cap)
@@ -743,28 +790,28 @@ class SlackTaskStream:
             clipped = self._reasoning_details[-cap:]
             sp = clipped.find(" ")
             self._reasoning_details = "…" + clipped[sp + 1 if 0 <= sp < 40 else 0:]
+        if completed:
+            # Rich publication supplies whole redacted bursts, never timer/token
+            # fragments. Defer title/body separation until the semantic boundary.
+            if self._started:
+                await self._finalize_reasoning_card()
+            return
         # Hold sub-threshold bursts: the flush timer can slice mid-word
         # ("I" as a whole card). Don't open/update the card until the
         # burst has substance; held text flushes with the next update or
-        # carries into the next burst at finalize.
+        # settles at the next semantic boundary.
         if len(self._reasoning_details) < min(self.REASONING_MIN_CHARS, cap):
             return
         # Title: short TLDR-style header (Claude-app rhythm — headers are
         # sub-sentence). First sentence of the thought, capped ~80 chars,
         # set once and never rewritten; the full text lives in details.
         if not self._reasoning_title:
-            head = self._reasoning_details
-            for sep in (". ", "! ", "? ", " — "):
-                idx = head.find(sep)
-                if 0 < idx < 120:
-                    head = head[: idx + 1].rstrip(" —")
-                    break
-            self._reasoning_title = f"💭 {_word_trim(head, 80)}"[:250]
+            self._reasoning_title = f"💭 {_reasoning_preview(self._reasoning_details)}"[:250]
         if not self._started:
             return  # buffered — flushed by the first task_started
         # Flush at sentence boundaries only: send the complete-sentence
         # prefix of the unsent buffer, hold the incomplete tail for the
-        # next flush (or the finalize/carry path). Cutting at raw timer
+        # next flush (or finalization). Cutting at raw timer
         # positions split sentences across cards. Join with a TRAILING
         # space — probe #4: Slack preserves trailing whitespace at chunk
         # joins but strips leading whitespace at some element boundaries
@@ -803,30 +850,30 @@ class SlackTaskStream:
     async def _finalize_reasoning_card(self) -> None:
         """Settle the open 💭 card when the next tool starts.
 
-        Sends any still-unsent text (complete or not — the burst is over,
-        so the remainder belongs to THIS card; only sub-threshold bursts
-        that never rendered are carried into the next burst instead of
-        emitting a fragment card).
+        Sends any still-unsent text, including short completed bursts. The
+        threshold holds partial updates, not complete semantic steps.
         """
         if self._reasoning_open_id is None:
             return
         cap = self.SLACK_FIELD_CEILING
         if self.REASONING_MAX_CHARS > 0:
             cap = min(cap, self.REASONING_MAX_CHARS)
-        if len(self._reasoning_details) < min(self.REASONING_MIN_CHARS, cap):
-            # Nothing was ever sent for this burst — roll it forward.
-            self._reasoning_carry = self._reasoning_details
-            self._reasoning_open_id = None
-            self._reasoning_details = ""
-            self._reasoning_unsent = ""
-            return
         tail, self._reasoning_unsent = self._reasoning_unsent, ""
-        delta = (tail.rstrip() + " ") if tail.strip() else ""
-        if self.REASONING_MAX_CHARS > 0:
-            delta = delta[:max(0, cap - self._reasoning_sent_chars)]
-        await self._append_reasoning_details(delta, status="complete")
+        rows = _completed_reasoning_rows(tail) if self._reasoning_completed else [("", tail)]
+        for index, (label, body) in enumerate(rows):
+            if index:
+                self._reasoning_count += 1
+                self._reasoning_open_id = f"think{self._reasoning_count}"
+            if self._reasoning_completed or not self._reasoning_title:
+                head = label or _reasoning_preview(body if self._reasoning_completed else self._reasoning_details)
+                self._reasoning_title = f"💭 {head}"[:250]
+            delta = (body.rstrip() + " ") if body.strip() else ""
+            if self.REASONING_MAX_CHARS > 0:
+                delta = delta[:max(0, cap - self._reasoning_sent_chars)]
+            await self._append_reasoning_details(delta, status="complete")
         self._reasoning_open_id = None
         self._reasoning_details = ""
+        self._reasoning_completed = False
 
     async def set_plan_title(self, title: str) -> None:
         """Set/update the card's collapsible header via a plan_update chunk.
@@ -1338,7 +1385,7 @@ class RichTaskCardSession:
     async def _flush_reasoning(self):
         pending, self.reasoning = self.reasoning, ""
         if pending and self.main is not None:
-            await self.main.reasoning_update(_redact_card_value(pending))
+            await self.main.reasoning_update(_redact_card_value(pending), completed=True)
 
     async def publish(self, events):
         from gateway.platforms.base import SendResult

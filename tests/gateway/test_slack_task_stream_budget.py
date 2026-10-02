@@ -180,6 +180,42 @@ async def test_default_reasoning_budget_remains_uncapped_across_many_deltas():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["first_tool", "turn_end"])
+@pytest.mark.parametrize("prefix", ["", "**Checking**\n\n"])
+@pytest.mark.parametrize("cap", [0, 1, 20, 80, 40_000])
+async def test_completed_paragraphs_keep_budget_and_do_not_replay_on_rollover(boundary, prefix, cap):
+    client = RenderingSlackClient()
+    stream = SlackTaskStream(client, "C1", "thread", reasoning_chars=cap, rollover_chars=10_000)
+    if boundary == "turn_end":
+        await stream.task_started("seed", "read_file")
+        await stream.task_finished("seed", "read_file")
+    body = "\n\n".join(f"Paragraph {index:04d} preserves one unique observation and its explanation." for index in range(1000))
+    text = prefix + body
+    await stream.reasoning_update(text, completed=True)
+    if boundary == "first_tool":
+        assert client.calls == []
+        await stream.task_started("boundary", "read_file")
+    await stream.stop()
+    admitted = text[:min(cap, stream.SLACK_FIELD_CEILING)] if cap else text
+    expected = admitted[len(prefix):] if prefix and admitted.startswith(prefix) else admitted
+    expected = expected.rstrip() + " "
+    if cap:
+        expected = expected[:min(cap, stream.SLACK_FIELD_CEILING)]
+    cards = thoughts(client)
+    assert "".join(card.get("details", "") for card in cards.values()) == expected
+    assert all(card["status"] == "complete" for card in cards.values())
+    assert all(len(c.get("details", "")) <= stream.SLACK_FIELD_CEILING
+               for _, payload in client.calls for c in payload.get("chunks", []))
+    if not cap:
+        assert client.open_count > 1
+        assert len({tid for _, tid in cards}) == 1
+        if prefix:
+            assert all(card["title"].startswith("💭 Checking") for card in cards.values())
+    else:
+        assert sum(len(card.get("details", "")) for card in cards.values()) <= cap
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("configured,wire", [("dense", "plan"), ("plan", "plan"), ("timeline", "timeline")])
 async def test_legacy_dense_config_is_a_supported_plan_wire_alias(configured, wire):
     from gateway.display_config import resolve_display_setting

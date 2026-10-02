@@ -30,6 +30,18 @@ async def test_disabled_stream_is_still_stopped_and_cannot_reopen():
 
 
 @pytest.mark.asyncio
+async def test_completed_reasoning_cannot_publish_after_stream_stop():
+    client = SDKClient()
+    stream = SlackTaskStream(client, "C1", "thread")
+    await stream.task_started("seed", "read_file")
+    await stream.stop()
+    before = list(client.calls)
+    await stream.reasoning_update("**Late heading**", completed=True)
+    await stream.stop()
+    assert client.calls == before
+
+
+@pytest.mark.asyncio
 async def test_reasoning_tuning_caps_wire_details_not_only_local_buffer():
     client = SDKClient()
     stream = SlackTaskStream(client, "C1", "thread", reasoning_chars=80)

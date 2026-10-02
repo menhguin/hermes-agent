@@ -140,6 +140,186 @@ async def test_real_wiring_publishes_rich_payloads_once_in_order(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_short_reasoning_steps_stay_separate_at_tool_boundaries(monkeypatch):
+    adapter, client = direct_adapter()
+    config = {"display": {"platforms": {"slack": {"tool_progress": "all", "tool_progress_native": True}}}}
+    _, turn = await make_turn(monkeypatch, config, adapter)
+    headings = ["**Locating script files**", "**Reading the script**"]
+    for index, heading in enumerate(headings):
+        turn.native_reasoning_callback(heading)
+        turn.native_tool_start_callback(f"call-{index}", "read_file", {"path": "script.py"})
+        turn.native_tool_complete_callback(f"call-{index}", "read_file", {}, "done")
+    await drain_turn(turn)
+    tasks = [c for _, p in client.calls for c in p.get("chunks", []) if c["type"] == "task_update"]
+    thoughts = [c for c in tasks if c["id"].startswith("think") and c["status"] == "complete"]
+    assert len(thoughts) == len(headings)
+    for index, (thought, heading) in enumerate(zip(thoughts, headings)):
+        assert heading.strip("*") in thought["title"]
+        assert tasks.index(thought) < next(i for i, c in enumerate(tasks) if c["id"] == f"call-{index}")
+
+
+@pytest.mark.asyncio
+async def test_completion_only_tool_boundary_keeps_preceding_heading_order(monkeypatch):
+    adapter, client = direct_adapter()
+    config = {"display": {"platforms": {"slack": {"tool_progress": "all", "tool_progress_native": True}}}}
+    _, turn = await make_turn(monkeypatch, config, adapter)
+    turn.native_reasoning_callback("**Checking result**")
+    turn.native_tool_complete_callback("call", "read_file", {}, "done")
+    await drain_turn(turn)
+    tasks = [c for _, p in client.calls for c in p.get("chunks", []) if c["type"] == "task_update"]
+    assert tasks[0]["title"] == "💭 Checking result"
+    assert tasks[1]["id"] == "call"
+
+
+@pytest.mark.asyncio
+async def test_terminal_heading_has_no_duplicate_expanded_body(monkeypatch):
+    adapter, client = direct_adapter()
+    config = {"display": {"platforms": {"slack": {"tool_progress": "all", "tool_progress_native": True}}}}
+    _, turn = await make_turn(monkeypatch, config, adapter)
+    turn.native_tool_start_callback("call", "read_file", {"path": "script.py"})
+    turn.native_tool_complete_callback("call", "read_file", {}, "done")
+    turn.native_reasoning_callback("**Checking logs**")
+    await drain_turn(turn)
+    thoughts = [c for _, p in client.calls for c in p.get("chunks", []) if c.get("id", "").startswith("think")]
+    assert len(thoughts) == 1
+    assert thoughts[0]["title"] == "💭 Checking logs"
+    assert thoughts[0]["status"] == "complete"
+    assert "details" not in thoughts[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("heading", ["**Checking records**", "## Checking records"])
+@pytest.mark.parametrize("separator", ["\n\n", "\r\n\r\n", "  \n\n", " \t\r\n\r\n"])
+@pytest.mark.parametrize("body", [
+    "The first paragraph explains the source.\n\nThe second preserves its own line.",
+    "    indented_example()\n\nThe explanation preserves the code indentation.",
+    "    indented_example()\r\n\r\nThe explanation preserves CRLF paragraphs.",
+])
+async def test_completed_heading_keeps_only_explanation_in_details(monkeypatch, heading, separator, body):
+    adapter, client = direct_adapter()
+    config = {"display": {"platforms": {"slack": {"tool_progress": "all", "tool_progress_native": True}}}}
+    _, turn = await make_turn(monkeypatch, config, adapter)
+    for char in heading + separator + body:
+        turn.native_reasoning_callback(char)
+    turn.native_tool_start_callback("call", "read_file", {})
+    await drain_turn(turn)
+    thoughts = [c for _, p in client.calls for c in p.get("chunks", []) if c.get("id", "").startswith("think")]
+    assert len(thoughts) == 1, "Token-sized callbacks are not semantic steps"
+    assert thoughts[0]["title"] == "💭 Checking records"
+    assert thoughts[0]["details"].rstrip() == body
+    assert thoughts[0]["status"] == "complete"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("separator", ["", " ", "\n\n"])
+async def test_heading_only_parts_in_one_burst_get_ordered_rows(monkeypatch, separator):
+    adapter, client = direct_adapter()
+    config = {"display": {"platforms": {"slack": {"tool_progress": "all", "tool_progress_native": True}}}}
+    _, turn = await make_turn(monkeypatch, config, adapter)
+    headings = ["Checking aggregate file", "Verifying aggregate records"]
+    for char in separator.join(f"**{heading}**" for heading in headings):
+        turn.native_reasoning_callback(char)
+    turn.native_tool_start_callback("call", "read_file", {})
+    await drain_turn(turn)
+    thoughts = [c for _, p in client.calls for c in p.get("chunks", []) if c.get("id", "").startswith("think")]
+    assert [c["title"] for c in thoughts] == [f"💭 {heading}" for heading in headings]
+    assert len({c["id"] for c in thoughts}) == len(headings)
+    assert all(c["status"] == "complete" and "details" not in c for c in thoughts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", ["", "Explanation stays below the overflow, not in the title."])
+async def test_long_heading_keeps_its_overflow_without_repeating_visible_prefix(monkeypatch, body):
+    adapter, client = direct_adapter()
+    config = {"display": {"platforms": {"slack": {"tool_progress": "all", "tool_progress_native": True}}}}
+    _, turn = await make_turn(monkeypatch, config, adapter)
+    heading = "Checking " + "specific aggregate record fields " * 5 + "before validation"
+    turn.native_reasoning_callback(f"**{heading}**" + ("\n\n" + body if body else ""))
+    turn.native_tool_start_callback("call", "read_file", {})
+    await drain_turn(turn)
+    thoughts = [c for _, p in client.calls for c in p.get("chunks", []) if c.get("id", "").startswith("think")]
+    assert len(thoughts) == 1
+    title = thoughts[0]["title"].removeprefix("💭 ")
+    assert title.endswith("…") and len(title) <= 80
+    rendered = title[:-1] + thoughts[0]["details"].rstrip()
+    assert rendered == heading + ("\n\n" + body if body else "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["First complete sentence.", "**label** body."])
+async def test_prose_only_burst_preserves_paragraphs_and_sentence_title(monkeypatch, first):
+    adapter, client = direct_adapter()
+    config = {"display": {"platforms": {"slack": {"tool_progress": "all", "tool_progress_native": True}}}}
+    _, turn = await make_turn(monkeypatch, config, adapter)
+    text = first + "\n\nSecond paragraph with **inline emphasis** is not a heading."
+    turn.native_reasoning_callback(text)
+    turn.native_tool_start_callback("call", "read_file", {})
+    await drain_turn(turn)
+    thoughts = [c for _, p in client.calls for c in p.get("chunks", []) if c.get("id", "").startswith("think")]
+    assert len(thoughts) == 1
+    assert thoughts[0]["title"] == f"💭 {first}"
+    assert thoughts[0]["details"].rstrip() == text
+
+
+@pytest.mark.asyncio
+async def test_heading_split_happens_after_whole_burst_secret_redaction(monkeypatch, request):
+    from agent import redact
+    adapter, client = direct_adapter()
+    config = {"display": {"platforms": {"slack": {"tool_progress": "all", "tool_progress_native": True}}}}
+    _, turn = await make_turn(monkeypatch, config, adapter)
+    secret = "private-heading-prefix**\n\n**private-heading-suffix"
+    redact.register_vault_redaction_value(secret)
+    request.addfinalizer(redact.clear_vault_redaction_values)
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    text = f"**Checking {secret}**"
+    for char in text:
+        turn.native_reasoning_callback(char)
+    turn.native_tool_start_callback("call", "read_file", {})
+    await drain_turn(turn)
+    thoughts = [c for _, p in client.calls for c in p.get("chunks", []) if c.get("id", "").startswith("think")]
+    assert len(thoughts) == 1
+    assert thoughts[0]["title"] == "💭 " + redact.redact_for_egress(text)[2:-2]
+    assert "details" not in thoughts[0]
+    assert "private-heading" not in str(client.calls)
+
+
+@pytest.mark.asyncio
+async def test_heading_only_no_tool_turn_does_not_open_stream(monkeypatch):
+    adapter, client = direct_adapter()
+    config = {"display": {"platforms": {"slack": {"tool_progress": "all", "tool_progress_native": True}}}}
+    ctx, turn = await make_turn(monkeypatch, config, adapter)
+    for char in "**Checking logs****Finishing check**":
+        turn.native_reasoning_callback(char)
+    await drain_turn(turn)
+    assert client.calls == []
+    turn.native_reasoning_callback("**Too late**")
+    assert ctx.progress_queue.empty()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["stale", "interrupted", "stop"])
+async def test_dead_turn_discards_pending_heading_without_reopening(monkeypatch, ending):
+    from gateway.slack_task_stream import RichTaskCardSession
+    adapter, client = direct_adapter()
+    ctx, _ = await make_turn(monkeypatch, {}, adapter)
+    session = RichTaskCardSession(adapter, ctx)
+    await session.publish([{"type": "tool.started", "tool_call_id": "seed", "tool_name": "read_file"}])
+    for char in "**Do not publish**":
+        await session.publish([{"type": "reasoning.delta", "text": char}])
+    before = len(client.calls)
+    if ending == "stale":
+        ctx._run_still_current = lambda: False
+    elif ending == "interrupted":
+        ctx.agent_holder[0] = SimpleNamespace(is_interrupted=True)
+    await session.stop(flush_reasoning=ending != "stop")
+    await session.stop()
+    assert client.calls[before:] == [("chat.stopStream", {"channel": "C1", "ts": "stream-1"})]
+    assert not (await session.publish([{"type": "reasoning.delta", "text": "**Late**"}])).success
+    assert client.opens == 1
+    assert "Do not publish" not in str(client.calls)
+
+
+@pytest.mark.asyncio
 async def test_child_streams_are_ordered_and_closed_on_completion_and_turn_cleanup(monkeypatch):
     adapter, client = direct_adapter()
     config = {"display": {"platforms": {"slack": {
