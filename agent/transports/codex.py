@@ -591,7 +591,9 @@ def _reasoning_fields(
             if params.get("github_reasoning_extra") is not None:
                 fields["reasoning"] = params["github_reasoning_extra"]
         else:
-            fields["reasoning"] = {"effort": effort, "summary": "auto"}
+            # [CUSTOM] Explicit Codex summary preference; preserve other Responses routes.
+            summary = "detailed" if params.get("is_codex_backend") is True else "auto"
+            fields["reasoning"] = {"effort": effort, "summary": summary}
             fields["include"] = include
     elif not is_github_responses and not is_xai_responses:
         fields["include"] = []

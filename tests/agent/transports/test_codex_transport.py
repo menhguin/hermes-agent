@@ -2019,3 +2019,14 @@ class TestOpenAIReasoningWireProjection:
         assert self._reasoning(transport, "o4-mini", None) == {"effort": "medium", "summary": "auto"}
         assert self._reasoning(transport, model, {"enabled": True, "effort": "high"},
                                base_url="https://relay.example.com/v1") == {"effort": "high", "summary": "auto"}
+
+
+def test_codex_backend_requests_detailed_summary_without_changing_effort(transport):
+    """Carnie's explicit summary preference applies to the Codex route, not thinking effort."""
+    kw = transport.build_kwargs(
+        model="gpt-6-astra", messages=[{"role": "user", "content": "Hi"}],
+        base_url="https://chatgpt.com/backend-api/codex", is_codex_backend=True,
+        reasoning_config={"enabled": True, "effort": "xhigh"},
+    )
+    assert kw["reasoning"] == {"effort": "xhigh", "summary": "detailed"}
+    assert kw["include"] == ["reasoning.encrypted_content"]
