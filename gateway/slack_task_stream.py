@@ -477,6 +477,7 @@ class SlackTaskStream:
         # in_progress at rollover are tracked so they can be replayed onto
         # the new card (their task ids don't exist there otherwise).
         self._stream_opened_at = 0.0
+        self._last_append_at: Optional[float] = None
         self._sent_chars = 0
         # Rendered size per field on this stream. Details accumulate; omitted
         # fields persist; title/status/output replace only when present.
@@ -542,6 +543,7 @@ class SlackTaskStream:
         if not self.ts:
             raise RuntimeError("chat.startStream returned no ts")
         self._stream_opened_at = time.monotonic()
+        self._last_append_at = None
         self._sent_chars = 0
         self._chunk_sizes = {}
 
@@ -935,7 +937,7 @@ class SlackTaskStream:
             # Track only DELIVERED tasks. Tracking this new chunk before rollover
             # replayed it once there and again below (details APPEND in Slack).
             async with self._send_lock:
-                if self.disabled:
+                if self.disabled or self._stopped:
                     return
                 # Proactive rollover: refresh the stream *before* Slack's
                 # ~5-min stream lifetime or per-message size cap kill it,
@@ -946,13 +948,34 @@ class SlackTaskStream:
                 ):
                     await self._rollover_locked()
                 try:
-                    await self._send_chunk_locked(chunk)
+                    if not await self._send_chunk_locked(chunk):
+                        return
                 except Exception as e:
-                    # Reactive rollover: both errors mean "this message can't
-                    # take more content" — recoverable with a fresh stream.
-                    if any(m in str(e) for m in ("message_not_in_streaming_state", "msg_too_long")):
+                    if self._stopped:
+                        return
+                    # These explicit rejections did not accept the chunk: a
+                    # fresh stream can continue it once. Missing-message errors
+                    # otherwise abandon native cards for the rest of a live turn.
+                    # Unknown transport outcomes must never replay append-only text.
+                    response = getattr(e, "response", None)
+                    code = response.get("error") if response is not None else None
+                    if response is None and type(e) is RuntimeError:
+                        # _GuardedCardClient turns an explicit ok:false result
+                        # into an exact RuntimeError code, unlike transport errors.
+                        code = str(e)
+                    if code in ("message_not_in_streaming_state", "msg_too_long", "message_not_found"):
+                        now = time.monotonic()
+                        logger.info(
+                            "task-card stream rejected: code=%s channel=%s thread=%s ts=%s "
+                            "team=%s age_s=%.3f last_append_age_s=%s chunk=%s/%s; continuing once",
+                            code, self.channel, self.thread_ts, self.ts, self.recipient_team_id,
+                            now - self._stream_opened_at,
+                            round(now - self._last_append_at, 3) if self._last_append_at is not None else None,
+                            chunk.get("type"), chunk.get("id"),
+                        )
                         await self._rollover_locked()
-                        await self._send_chunk_locked(chunk)
+                        if not await self._send_chunk_locked(chunk):
+                            return
                     else:
                         raise
                 if status == "in_progress":
@@ -974,13 +997,18 @@ class SlackTaskStream:
             logger.warning("chat.appendStream failed, disabling native task cards: %s", e)
             self.disabled = True
 
-    async def _send_chunk_locked(self, chunk: dict[str, Any]) -> None:
-        """Send one chunk on the current stream. Caller holds _send_lock."""
+    async def _send_chunk_locked(self, chunk: dict[str, Any]) -> bool:
+        """Send while live; return whether accepted. Caller holds _send_lock."""
+        # stop() latches outside this lock, even while a previous send awaits.
+        # Already-dispatched writes cannot be unsent, but no new ones may start.
+        if self._stopped:
+            return False
         await self.client.chat_appendStream(
             channel=self.channel,
             ts=self.ts,
             chunks=[chunk],
         )
+        self._last_append_at = time.monotonic()
         # Approximate rendered characters, not wire traffic: details APPEND
         # even when every delta has the same length. Other fields REPLACE,
         # and an omitted field leaves its prior value intact. Count only
@@ -995,6 +1023,7 @@ class SlackTaskStream:
             else:
                 self._sent_chars += size - sizes.get(field, 0)
                 sizes[field] = size
+        return True
 
     async def _rollover_locked(self) -> None:
         """Close the current stream and continue on a fresh one.
@@ -1018,6 +1047,8 @@ class SlackTaskStream:
             # The ⤵ suffix hands off to in_progress on the fresh card below;
             # ordinary tool/reasoning segments retain their complete settlement.
             for tid, chunk in list(self._in_progress.items()):
+                if self._stopped:
+                    return
                 # Settlement updates replace only title/status. Resending details
                 # here duplicates the whole card body on the old message.
                 settled = {k: chunk[k] for k in ("type", "id", "title")}
@@ -1029,6 +1060,8 @@ class SlackTaskStream:
                     )
                 except Exception:
                     break  # old stream already dead — skip the rest
+            if self._stopped:
+                return
             await self.client.chat_stopStream(
                 channel=self.channel,
                 ts=self.ts,
@@ -1040,7 +1073,13 @@ class SlackTaskStream:
         except Exception as e:
             # Old stream may already be dead (that's why we're here).
             logger.info("rollover: closing old stream failed (non-fatal): %s", e)
+        if self._stopped:
+            return
         await self._open_stream()
+        # If stop latched while startStream was in flight, it will close the
+        # returned ts after we release _send_lock; do not publish onto it.
+        if self._stopped:
+            return
         logger.info(
             "rollover: continued task cards on fresh stream ts=%s (rollover #%d)",
             self.ts, self._rollovers,
@@ -1064,7 +1103,8 @@ class SlackTaskStream:
             chunk = dict(c)
             replay.append(chunk)
         for chunk in replay:
-            await self._send_chunk_locked(chunk)
+            if not await self._send_chunk_locked(chunk):
+                return
 
     async def handoff_pending(self, task_ids=None) -> None:
         """End this turn's live display without claiming the child finished.

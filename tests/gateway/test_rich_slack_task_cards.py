@@ -383,6 +383,133 @@ async def test_transport_failure_falls_back_as_interim_and_stops_open_stream(mon
 
 
 @pytest.mark.asyncio
+async def test_missing_stream_continues_natively_without_text_fallback(monkeypatch):
+    """A definitive missing-message rejection must not kill a live turn's cards."""
+    from gateway.platforms.base import SendResult
+    adapter, client = direct_adapter()
+    config = {"display": {"platforms": {"slack": {
+        "tool_progress": "all", "tool_progress_native": True,
+        "tool_progress_native_mode": "plan",
+    }}}}
+    _, turn = await make_turn(monkeypatch, config, adapter)
+    original = client.api_call
+    expired = False
+    rejected = []
+
+    async def missing_after_first_batch(method, *, json):
+        nonlocal expired
+        chunks = json.get("chunks", [])
+        if method == "chat.appendStream" and json.get("ts") == "stream-1":
+            if expired:
+                rejected.extend(chunks)
+                return {"ok": False, "error": "message_not_found"}
+            if any(c.get("id") == "first" and c.get("status") == "complete" for c in chunks):
+                expired = True
+        return await original(method, json=json)
+
+    client.api_call = missing_after_first_batch
+    fallbacks = []
+
+    async def fallback(**kwargs):
+        fallbacks.append(kwargs)
+        return SendResult(success=True, message_id="fallback")
+
+    adapter.send = adapter.edit_message = fallback
+    turn.native_reasoning_callback("**Checking installed runtime state**")
+    turn.native_tool_start_callback("first", "read_file", {"path": "README.md"})
+    turn.native_tool_complete_callback("first", "read_file", {}, "done")
+    turn.native_reasoning_callback("**Checking the next source**\n\nFresh explanation.")
+    turn.native_tool_start_callback("second", "read_file", {"path": "next.md"})
+    turn.native_tool_complete_callback("second", "read_file", {}, "done")
+    await drain_turn(turn)
+
+    assert rejected, "fixture must exercise the actual missing-message boundary"
+    assert fallbacks == [], "missing-message recovery must retain the native progress lane"
+    assert client.opens == 2
+    accepted = [c for _, p in client.calls for c in p.get("chunks", [])]
+    fresh = [c for _, p in client.calls if p.get("ts") == "stream-2" for c in p.get("chunks", [])]
+    assert any(c.get("id") == "second" and c.get("status") == "complete" for c in fresh)
+    assert "".join(c.get("details", "") for c in accepted) == "Fresh explanation. "
+    assert any(c.get("type") == "plan_update" and c["title"].startswith("⤵") for c in fresh)
+    assert all(p["task_display_mode"] == "plan" for m, p in client.calls if m == "chat.startStream")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fence", ["stale", "interrupted", "egress"])
+async def test_missing_stream_recovery_cannot_escape_turn_fences(monkeypatch, fence):
+    from gateway.platforms.base import SendResult
+    adapter, client = direct_adapter()
+    config = {"display": {"platforms": {"slack": {"tool_progress": "all", "tool_progress_native": True}}}}
+    ctx, turn = await make_turn(monkeypatch, config, adapter)
+    original = client.api_call
+    rejected = False
+
+    async def fail_and_fence(method, *, json):
+        nonlocal rejected
+        if method == "chat.appendStream" and any(c.get("id") == "second" for c in json.get("chunks", [])):
+            rejected = True
+            if fence == "stale":
+                ctx._run_still_current = lambda: False
+            elif fence == "interrupted":
+                ctx.agent_holder[0] = SimpleNamespace(is_interrupted=True)
+            else:
+                adapter._outbound_blocked = lambda *a: SendResult(
+                    success=False, error="declined", raw_response={"code": "egress_declined"})
+            return {"ok": False, "error": "message_not_found"}
+        return await original(method, json=json)
+
+    client.api_call = fail_and_fence
+
+    async def forbidden(**kwargs):
+        pytest.fail("ended or unauthorized turn must not fall back to text")
+
+    adapter.send = forbidden
+    turn.native_tool_start_callback("first", "read_file", {})
+    turn.native_tool_complete_callback("first", "read_file", {}, "done")
+    turn.native_tool_start_callback("second", "read_file", {})
+    await drain_turn(turn)
+    assert rejected
+    assert client.opens == 1
+    assert not any(c.get("id") == "second" for _, p in client.calls for c in p.get("chunks", []))
+
+
+@pytest.mark.asyncio
+async def test_repeated_missing_stream_failure_falls_back_after_one_continuation(monkeypatch):
+    from gateway.platforms.base import SendResult
+    adapter, client = direct_adapter()
+    config = {"display": {"platforms": {"slack": {"tool_progress": "all", "tool_progress_native": True}}}}
+    _, turn = await make_turn(monkeypatch, config, adapter)
+    original = client.api_call
+    missing = False
+
+    async def keep_rejecting(method, *, json):
+        nonlocal missing
+        if method == "chat.appendStream":
+            if missing or any(c.get("id") == "second" for c in json.get("chunks", [])):
+                missing = True
+                return {"ok": False, "error": "message_not_found"}
+        return await original(method, json=json)
+
+    client.api_call = keep_rejecting
+    fallbacks = []
+
+    async def fallback(**kwargs):
+        fallbacks.append(kwargs)
+        return SendResult(success=True, message_id="fallback")
+
+    adapter.send = adapter.edit_message = fallback
+    turn.native_tool_start_callback("first", "read_file", {})
+    turn.native_tool_complete_callback("first", "read_file", {}, "done")
+    turn.native_tool_start_callback("second", "read_file", {})
+    turn.native_tool_complete_callback("second", "read_file", {}, "done")
+    await drain_turn(turn)
+    assert missing
+    assert client.opens == 2
+    assert len(fallbacks) == 1
+    assert fallbacks[0]["content"].startswith("Hermes is working")
+
+
+@pytest.mark.asyncio
 async def test_egress_decline_remains_terminal_for_all_rich_updates(monkeypatch):
     from gateway.platforms.base import SendResult
     adapter, client = direct_adapter()
