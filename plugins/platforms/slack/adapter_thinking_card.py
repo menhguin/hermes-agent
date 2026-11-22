@@ -147,6 +147,31 @@ class SlackThinkingCardMixin:
                 logger.debug("[Slack] Thinking-card completion flip failed", exc_info=True)
         await self._stop_native_task_card_stream(key, stream)
 
+    async def rotate_thinking_card_if_due(
+        self, chat_id: str, *, reply_to: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None) -> bool:
+        """Close the thinking card before Slack's stream lifetime seals it (rows are in_progress
+        until the turn ends, and Slack's seal turns them into ``error``); the next row opens a
+        fresh card. Returns whether it rotated."""
+        key = self._native_task_card_key(chat_id, reply_to, metadata, slot=THINKING_SLOT)
+        stream = self._native_task_card_streams.get(key) if key is not None else None
+        if stream is None or stream.stopped or not stream.stream_ts:
+            return False
+        async with stream.lock:
+            if stream.stopped or not stream.stream_ts or not self._native_task_card_due_for_rotation(stream):
+                return False
+            closing = [{"type": "plan_update", "title": t("platform.slack.task_card.continued")[:256]},
+                       *({"type": "task_update", "id": row["id"], "title": row["title"], "status": "complete"}
+                         for row in [*stream.thinking_rows, *stream.rows.values()])]
+            try:
+                await self._get_client(stream.channel, team_id=stream.team_id).api_call(
+                    "chat.stopStream", json={"channel": stream.channel, "ts": stream.stream_ts, "chunks": closing})
+            except Exception as exc:
+                logger.info("[Slack] Thinking-card rotation could not close %s: %s", stream.stream_ts, exc,
+                            exc_info=True)
+            stream.stream_ts, stream.thinking_rows, stream.rows = "", [], {}
+        return True
+
     def _thinking_card_stream(self, chat_id, reply_to, metadata):
         key = self._native_task_card_key(chat_id, reply_to, metadata, slot=THINKING_SLOT)
         if key is None:

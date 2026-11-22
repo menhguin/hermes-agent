@@ -199,6 +199,27 @@ async def test_reasoning_block_shows_thinking_then_thought_for_seconds(monkeypat
     assert client.frames()[-1][0] == "chat.stopStream"
 
 
+@pytest.mark.asyncio
+async def test_thinking_card_closes_before_slack_seals_its_running_rows():
+    adapter, client = _adapter({"thinking_cards": True, "native_task_card_rotate_seconds": 60})
+    q = queue.Queue()
+    ctx = NS(source=NS(chat_id="C1"), thinking_queue=q, _native_slack_thinking_cards=True, _progress_reply_to="1.1",
+             _progress_metadata={"thread_id": "1.1"}, _cleanup_progress=False, agent_holder=[None])
+    alive = {"v": True}
+    ctx._run_still_current = lambda: alive["v"]
+    runner = TurnRunner(NS(_delivery_adapter_for=lambda source: adapter), ctx)
+    task = asyncio.create_task(runner.send_thinking_card_messages())
+    q.put({"type": "thinking", "text": "Checking both config paths first."})
+    await async_wait_until(lambda: _titles(client, "Checking"), what="narration row")
+    (stream,) = adapter._native_task_card_streams.values()
+    stream.started_at -= 61
+    await async_wait_until(lambda: client.frames()[-1][0] == "chat.stopStream", what="rotation")
+    alive["v"] = False
+    await asyncio.wait_for(task, timeout=3)
+    closing = client.frames()[2][1]
+    assert closing == [("Continued below ⤵", None), ("Checking both config paths first.", "complete")]
+
+
 def _titles(client, prefix):
     return [title for method, chunks in client.frames() if method == "chat.appendStream"
             for title, _ in chunks if str(title).startswith(prefix)]

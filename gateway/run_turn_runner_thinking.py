@@ -199,6 +199,10 @@ class TurnRunnerThinkingMixin:
             st.block = None
 
     async def _thinking_card_tick(self, st: _ThinkingCardState) -> None:
+        rotate = getattr(st.adapter, "rotate_thinking_card_if_due", None)
+        if callable(rotate) and not st.native_failed and not st.publication_suppressed:
+            ctx = self._ctx
+            await rotate(ctx.source.chat_id, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata)
         block = st.block
         if block is not None and not block.shown and time.monotonic() - block.started >= REASONING_CARD_AFTER_S:
             await self._reasoning_row(st, done=False)
