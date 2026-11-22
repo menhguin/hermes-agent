@@ -1212,6 +1212,10 @@ class SlackTaskStream:
         except Exception:
             logger.debug("child task-card handoff failed", exc_info=True)
 
+    def _terminal_title(self) -> str:
+        title = steps_title(self._task_count, self._failed_count)
+        return (f"{self.header_label} — {title}" if self.header_label else title)[:250]
+
     async def stop(self, final_text: Optional[str] = None, *, flush_reasoning: bool = True) -> None:
         """Close the streaming message. No-op if never started or already stopped."""
         if self._stopped or not self._started:
@@ -1226,6 +1230,10 @@ class SlackTaskStream:
             logger.debug("reasoning card cleanup failed", exc_info=True)
         if flush_reasoning and self._plan.editing and not self._stopped:
             async with self._send_lock:
+                if self._task_count and not self._is_subagent:
+                    # An edited card has no stopStream: the terminal header rides the last edit,
+                    # after any header still queued for it.
+                    self._plan.queue.append({"type": "plan_update", "title": self._terminal_title()})
                 await self._plan.flush(final=True)
         self._stopped = True
         if self._plan.closed_stream:
@@ -1242,10 +1250,7 @@ class SlackTaskStream:
                     kwargs["markdown_text"] = final_text
                 elif self._task_count and not self._is_subagent:
                     # Terminal header with the close: never a finished card that still reads live (#141643).
-                    title = steps_title(self._task_count, self._failed_count)
-                    if self.header_label:
-                        title = f"{self.header_label} — {title}"
-                    kwargs["chunks"] = [{"type": "plan_update", "title": title[:250]}]
+                    kwargs["chunks"] = [{"type": "plan_update", "title": self._terminal_title()}]
                 # Footer: a context block with turn stats, attached to the
                 # final message via stopStream's blocks parameter. Plain
                 # context blocks need no interactivity handler (unlike

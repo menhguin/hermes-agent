@@ -104,6 +104,20 @@ async def test_age_transition_preserves_exact_details_once_and_same_message(cloc
 
 
 @pytest.mark.asyncio
+async def test_edited_card_closes_with_terminal_header_after_age_transition(clock):
+    wire = Wire()
+    card = stream(wire, rollover_age_s=240)
+    await card.task_started("one", "read_file")
+    clock[0] += 301
+    await card.task_finished("one", "read_file", summary="Done")
+    # A new category's header is still queued (edits coalesce for 3 s) when the turn ends.
+    await card.task_started("two", "terminal")
+    await card.task_finished("two", "terminal", summary="Done")
+    await card.stop()
+    assert wire.messages["stream-1"]["blocks"][0]["title"] == "Ran 2 steps"
+
+
+@pytest.mark.asyncio
 async def test_reactive_expiry_does_not_duplicate_rejected_chunk(clock):
     wire = Wire()
     card = stream(wire)
