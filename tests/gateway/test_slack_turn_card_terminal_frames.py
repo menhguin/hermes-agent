@@ -115,6 +115,7 @@ async def test_stop_mid_tool_closes_with_stopped_title_and_no_running_row():
     assert method == "chat.stopStream"
     assert chunks[0][0].startswith("Stopped")
     assert "in_progress" not in {status for _, status in chunks[1:]}
+    assert chunks[1:] == [("delegate_task", "complete")]  # the queued completion lands before the close
 
 
 @pytest.mark.asyncio
