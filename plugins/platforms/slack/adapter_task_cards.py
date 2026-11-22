@@ -290,6 +290,15 @@ class SlackTaskCardMixin:
         if stream is not None:
             await self._stop_native_task_card_stream(key, stream, stream.final_chunks or None)
 
+    def native_task_card_rotation_due(
+        self, chat_id: str, *, reply_to: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None) -> bool:
+        """Whether the live tool card is past its rotate age (the gateway polls this between events)."""
+        key = self._native_task_card_key(chat_id, reply_to, metadata)
+        stream = self._native_task_card_streams.get(key) if key is not None else None
+        return bool(stream is not None and stream.stream_ts and not stream.stopped
+                    and self._native_task_card_due_for_rotation(stream))
+
     def _native_task_card_due_for_rotation(self, stream: _NativeTaskCardStream) -> bool:
         limit = _rotate_seconds(self.config.extra)
         return limit > 0 and time.monotonic() - stream.started_at >= limit

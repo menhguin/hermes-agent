@@ -695,6 +695,14 @@ class GatewayTurnProgressMixin:
         stage(ctx.source.chat_id, title=title, tasks=rows, reply_to=ctx._progress_reply_to,
               metadata=ctx._progress_metadata)
 
+    def _task_card_rotation_due(self, st) -> bool:
+        """The live card is past its rotate age: a quiet stretch must not let Slack seal it."""
+        due = getattr(st.adapter, "native_task_card_rotation_due", None)
+        ctx = self._ctx
+        return bool(callable(due) and st.tasks and not st.native_failed and not st.publication_suppressed
+                    and not self._agent_interrupted()
+                    and due(ctx.source.chat_id, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata))
+
     async def _send_native_task_card_progress(self, adapter) -> None:
         """Drain progress into native cards; supported destinations retain editable fallback.
         Unsupported destinations and egress refusals suppress publication, never finalization.
@@ -710,6 +718,8 @@ class GatewayTurnProgressMixin:
                 try:
                     raw = ctx.progress_queue.get_nowait()
                 except queue.Empty:
+                    if self._task_card_rotation_due(st):
+                        await self._task_card_publish(st)  # rotates before Slack's seal
                     await asyncio.sleep(0.1)
                     continue
                 if not self._agent_interrupted() and st.apply_event(raw):

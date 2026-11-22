@@ -135,6 +135,22 @@ async def test_card_rotates_before_slack_lifetime_with_closing_frame(monkeypatch
     assert "in_progress" not in {status for _, status in closing[1:]}
 
 
+@pytest.mark.asyncio
+async def test_quiet_card_rotates_without_waiting_for_a_progress_event():
+    # A long tool call or a long answer sends no event: the card must still close before Slack's seal.
+    adapter, client = _adapter({"native_task_card_rotate_seconds": 60})
+    runner = GatewayTurnProgressMixin.__new__(GatewayTurnProgressMixin)
+    runner._ctx = _ctx(_events(_started(1, "terminal")), {"v": True}, NS(is_interrupted=False))
+    loop = asyncio.create_task(runner._send_native_task_card_progress(adapter))
+    await async_wait_until(lambda: _appends(adapter) == 1, what="first frame")
+    (stream,) = adapter._native_task_card_streams.values()
+    stream.started_at -= 61
+    await async_wait_until(lambda: [m for m, _ in client.frames()].count("chat.startStream") == 2, what="rotation")
+    loop.cancel()
+    await asyncio.gather(loop, return_exceptions=True)
+    assert client.frames()[2] == ("chat.stopStream", [("Continued below ⤵", None), ("terminal ⤵", "complete")])
+
+
 def test_rollup_reads_ran_n_steps_and_a_recovered_failure_keeps_no_error_badge():
     steps = [{"title": "read_file - a", "name": "read_file", "status": "complete"},
              {"title": "terminal - x", "name": "terminal", "status": "error"},
